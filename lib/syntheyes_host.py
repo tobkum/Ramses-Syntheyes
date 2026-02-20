@@ -98,10 +98,11 @@ class SynthEyesHost(RamHost):
             os.makedirs(target_dir, exist_ok=True)
 
         try:
-            # In SynthEyes, we set the filename and then trigger a save action.
-            # SaveSNI() is the most robust SyPy method for this.
+            # Set the target path then save. SaveIfChanged() is the correct
+            # SyPy3 save method; after SetSNIFileName the scene is considered
+            # modified (filename changed), so this always writes to the new path.
             self.hlev.SetSNIFileName(filePath)
-            self.hlev.SaveSNI()
+            self.hlev.SaveIfChanged()
             
             # Store metadata in a Note object if item is provided
             if item:
@@ -220,11 +221,16 @@ class SynthEyesHost(RamHost):
             # attributes, so they live outside the shot undo block.
             self.hlev.AcceptShotChanges(shot, "Ramses: Setup Scene")
 
-            if "duration" in setupOptions and setupOptions["duration"] > 0:
+            frames = int(setupOptions.get("frames", 0))
+            if not frames:
+                # Fallback: derive frame count from duration (seconds) × framerate
+                dur = float(setupOptions.get("duration", 0))
+                fps = float(setupOptions.get("framerate", 24.0))
+                frames = round(dur * fps)
+            if frames > 0:
                 start = RAM_SETTINGS.userSettings.get("compStartFrame", 1001)
-                duration = int(setupOptions["duration"])
                 self.hlev.SetAnimStart(start)
-                self.hlev.SetAnimEnd(start + duration - 1)
+                self.hlev.SetAnimEnd(start + frames - 1)
 
             # Persist identity
             self._store_ramses_metadata(item, step)
@@ -287,18 +293,7 @@ class SynthEyesHost(RamHost):
         res = self.hlev.NewSceneAndShot(self.normalizePath(footagePath), aspect)
         
         if res:
-            # Setup scene parameters
-            setup_opts = {
-                "width": project.width(),
-                "height": project.height(),
-                "framerate": project.framerate(),
-                "pixelAspectRatio": project.pixelAspectRatio(),
-                "aspectRatio": project.aspectRatio()
-            }
-            if item.itemType() == ItemType.SHOT:
-                setup_opts["duration"] = item.duration()
-                
-            self._setupCurrentFile(item, step, setup_opts)
+            self._setupCurrentFile(item, step, self.collectItemSettings(item))
             self._store_ramses_metadata(item, step)
             return True
             
@@ -383,20 +378,19 @@ class SynthEyesHost(RamHost):
         if hasattr(self, 'app') and self.app:
             try:
                 from ramses_ui_pyside.open_dialog import RamOpenDialog
-                from PySide2 import QtWidgets as qw
+                try:
+                    from PySide2 import QtWidgets as qw
+                except ImportError:
+                    from PySide6 import QtWidgets as qw
 
                 dialog = RamOpenDialog( ["sni"] )
-                
+
                 # --- Pre-set Defaults ---
                 project = RAMSES.project()
                 if project:
                     mamo_step = project.step("MaMo") or project.step("Matchmove")
                     if mamo_step:
                         dialog.setCurrentStep(mamo_step)
-
-                dialog.setWindowFlags(dialog.windowFlags() | qc.Qt.WindowStaysOnTopHint)
-                dialog.raise_()
-                dialog.activateWindow()
 
                 if getattr(dialog, 'exec', None):
                     res = dialog.exec()
@@ -513,7 +507,16 @@ class SynthEyesHost(RamHost):
     # --- Mandatory Ramses API Overrides ---
 
     def _import(self, filePaths: list, item: RamItem, step: RamStep, importOptions: list, forceShowImportUI: bool) -> bool:
-        return False
+        """Loads published footage into SynthEyes as a new scene/shot.
+
+        For image sequences, filePaths contains all frame files — we pass the
+        first frame and SynthEyes auto-detects the full sequence.
+        For movie clips, filePaths contains the single movie file.
+        """
+        if not self.hlev or not filePaths:
+            return False
+        footage_path = self.normalizePath(filePaths[0])
+        return self.newShot(footage_path, item, step)
 
     def _importUI(self, item: RamItem, step: RamStep) -> dict:
         if hasattr(self, 'app') and self.app:

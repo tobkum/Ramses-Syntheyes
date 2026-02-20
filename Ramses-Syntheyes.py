@@ -128,10 +128,15 @@ def run_app():
             self.host = SynthEyesHost(hlev)
             # Assign to the host attribute directly as Ramses object has no setHost method
             self.ramses.host = self.host
+            self.host.app = self  # Required: dialog methods check hasattr(self, 'app')
             self.hlev = hlev
             
             self.setWindowTitle("Ramses - SynthEyes")
-            
+            self.setStyleSheet(
+                "QMainWindow { background-color: #1a1a1a; }"
+                "QWidget { background-color: #1a1a1a; color: #cccccc; }"
+            )
+
             self.setup_ui()
             self.refresh_context()
 
@@ -143,82 +148,163 @@ def run_app():
             layout.setContentsMargins(4, 4, 4, 4)
             layout.setSpacing(4)
 
-            # Context Label
+            # Context Label — matches Fusion's ContextFrame style
             self.context_label = qw.QLabel("No Active Shot")
-            self.context_label.setStyleSheet("font-weight: bold; color: #CCC; background-color: #1e2228; padding: 8px; border: 1px solid #3a4048; border-radius: 4px;")
+            self.context_label.setStyleSheet(
+                "QLabel { border: 1px solid #3a4048; background-color: #1e2228;"
+                " border-radius: 4px; padding: 8px; }"
+            )
             self.context_label.setAlignment(qc.Qt.AlignCenter)
             self.context_label.setWordWrap(True)
+            self.context_label.setMinimumHeight(70)
             layout.addWidget(self.context_label)
 
             layout.addSpacing(5)
 
-            # Group 1: Scene Setup
-            self.btn_switch = self.create_button("Browse Shots", "ramshot.png", self.on_switch_shot)
+            # Group 1: Project & Scene  (blue — #2a3442)
+            self.btn_switch = self.create_button("Browse Shots", "ramshot.png", self.on_switch_shot, "#2a3442")
             layout.addWidget(self.btn_switch)
-            
-            self.btn_sync = self.create_button("Sync Settings", "ramsetupscene.png", self.on_sync)
+            self.btn_import = self.create_button("Import Footage", "ramimport.png", self.on_import, "#2a3442")
+            layout.addWidget(self.btn_import)
+            self.btn_sync = self.create_button("Sync Settings", "ramsetupscene.png", self.on_sync, "#2a3442")
             layout.addWidget(self.btn_sync)
 
-            layout.addSpacing(10)
+            layout.addSpacing(8)
 
-            # Group 2: Saving
-            self.btn_save = self.create_button("Save", "ramsave.png", self.on_save)
+            # Group 2: Working (teal — #2a423d)
+            self.btn_save = self.create_button("Save", "ramsave.png", self.on_save, "#2a423d")
             layout.addWidget(self.btn_save)
-
-            self.btn_incremental = self.create_button("Save New Version", "ramsaveincremental.png", self.on_incremental)
+            self.btn_incremental = self.create_button("Save New Version", "ramsaveincremental.png", self.on_incremental, "#2a423d")
             layout.addWidget(self.btn_incremental)
-
-            self.btn_save_as = self.create_button("Save As / Create...", "ramsave.png", self.on_save_as)
+            self.btn_retrieve = self.create_button("Version History / Restore", "ramretrieve.png", self.on_retrieve, "#2a423d")
+            layout.addWidget(self.btn_retrieve)
+            self.btn_save_as = self.create_button("Save As / Create...", "ramsave.png", self.on_save_as, "#2a423d")
             layout.addWidget(self.btn_save_as)
 
-            layout.addSpacing(10)
+            layout.addSpacing(8)
 
-            # Group 3: Publish
-            self.btn_export = self.create_button("Export to Pipeline", "rampreview.png", self.on_export)
+            # Group 3: Publish (green — #2a422a)
+            self.btn_export = self.create_button("Export to Pipeline", "rampreview.png", self.on_export, "#2a422a")
             layout.addWidget(self.btn_export)
-
-            self.btn_status = self.create_button("Update Status", "ramstatus.png", self.on_status)
+            self.btn_status = self.create_button("Update Status", "ramstatus.png", self.on_status, "#2a422a")
             layout.addWidget(self.btn_status)
 
-            self.btn_update = self.create_button("Check for Update", "ramupdate.png", self.on_check_update)
+            layout.addSpacing(8)
+
+            # Group 4: Settings (neutral — #333333)
+            self.btn_update = self.create_button("Check for Update", "ramupdate.png", self.on_check_update, "#333333")
             layout.addWidget(self.btn_update)
 
             layout.addStretch()
 
-            # Footer
+            # Footer version label
             self.btn_about = qw.QPushButton("Ramses v" + self.settings.version)
             self.btn_about.setFlat(True)
-            self.btn_about.setStyleSheet("color: #555; font-size: 10px;")
+            self.btn_about.setStyleSheet("QPushButton { color: #555; font-size: 10px; background: transparent; border: none; }")
             self.btn_about.clicked.connect(self.on_about)
             layout.addWidget(self.btn_about)
 
-        def create_button(self, text, icon_name, callback):
+        def create_button(self, text, icon_name, callback, accent_color=None):
             btn = qw.QPushButton(" " + text)
-            btn.setMinimumHeight(32)
+            btn.setMinimumHeight(30)
+            btn.setMaximumHeight(30)
             icon_path = os.path.join(script_dir, "icons", icon_name)
             if os.path.exists(icon_path):
                 btn.setIcon(qg.QIcon(icon_path))
+                btn.setIconSize(qc.QSize(16, 16))
             btn.clicked.connect(callback)
-            btn.setStyleSheet("QPushButton { text-align: left; padding-left: 8px; }")
+
+            if accent_color:
+                h = accent_color.lstrip("#")
+                hr, hg, hb = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+                hover   = "#%02x%02x%02x" % (min(255, hr+15), min(255, hg+15), min(255, hb+15))
+                pressed = "#%02x%02x%02x" % (max(0, hr-10),   max(0, hg-10),   max(0, hb-10))
+                ss = (
+                    f"QPushButton {{ text-align: left; padding-left: 12px;"
+                    f" border: 1px solid #222; border-radius: 3px; background-color: {accent_color}; }}"
+                    f"QPushButton:hover {{ background-color: {hover}; }}"
+                    f"QPushButton:pressed {{ background-color: {pressed}; }}"
+                    "QPushButton:disabled { background-color: #222; color: #555; border: 1px solid #1a1a1a; }"
+                )
+            else:
+                ss = "QPushButton { text-align: left; padding-left: 12px; border: 1px solid #222; border-radius: 3px; }"
+            btn.setStyleSheet(ss)
             return btn
 
-        def refresh_header(self):
-            """Unified refresh method."""
-            self.refresh_context()
-
         def refresh_context(self):
-            """Updates the context label based on current file."""
+            """Updates the context label and button states based on current file."""
             item = self.host.currentItem()
             step = self.host.currentStep()
-            
-            if item and step:
+            in_pipeline = bool(item and item.uuid() and step)
+
+            if in_pipeline:
                 project = item.project()
-                project_name = project.shortName() if project else "UNK"
-                self.context_label.setText(f"<font color='#777' size='2'>{project_name}</font><br><font color='#FFF' size='4'>{item.shortName()}</font><br><font color='#aaa' size='2'>{step.shortName()}</font>")
+                project_name = (project.name() if project else item.projectShortName()).upper()
+                item_name = item.shortName()
+
+                # Sequence prefix (for shots only)
+                seq_prefix = ""
+                try:
+                    if item.itemType() == ram.ItemType.SHOT:
+                        seq = item.sequence()
+                        if seq:
+                            seq_prefix = f"<font color='#666'><b>{seq.shortName()}</b> | </font>"
+                except Exception:
+                    pass
+
+                # Step with color
+                step_name = "No Step"
+                if step:
+                    step_color = step.colorName()
+                    step_name = f"<font color='{step_color}'>{step.name()}</font>"
+
+                # State with color + Priority suffix
+                state_label = ""
+                priority_suffix = ""
+                try:
+                    status = self.host.currentStatus()
+                    if status:
+                        prio = int(status.get("priority", 0))
+                        if prio == 1:
+                            priority_suffix = " <font color='#ffcc00'>!</font>"
+                        elif prio == 2:
+                            priority_suffix = " <font color='#ff8800'>!!</font>"
+                        elif prio >= 3:
+                            priority_suffix = " <font color='#ff0000'>!!!</font>"
+                        if status.state():
+                            state = status.state()
+                            state_color = state.colorName()
+                            state_label = f" <font color='#555'>|</font> <font color='{state_color}'><b>{state.shortName()}</b></font>"
+                except Exception:
+                    pass
+
+                html = (
+                    f"<font color='#777' size='3'>{project_name}</font><br>"
+                    f"{seq_prefix}<font color='#FFF' size='5'><b>{item_name}</b>{priority_suffix}</font><br>"
+                    f"<font size='3'>{step_name}{state_label}</font>"
+                )
+                self.context_label.setText(html)
             else:
-                self.context_label.setText("<font color='#cc9900'>External Scene</font><br><font color='#777'>Not in Pipeline</font>")
+                path = self.host.currentFilePath()
+                if path:
+                    self.context_label.setText("<font color='#cc9900'>External Scene</font><br><font color='#777'>Not in a Ramses Project</font>")
+                else:
+                    self.context_label.setText("<font color='#cc9900'>No Active Scene</font>")
+
+            # Buttons that require a pipeline context (known item + step)
+            for btn in (self.btn_save, self.btn_incremental, self.btn_retrieve,
+                        self.btn_sync, self.btn_export, self.btn_status):
+                btn.setEnabled(in_pipeline)
+
+            # Save As / Create is always available (used to enter the pipeline)
+            # Browse Shots, Check for Update, About are always available
 
         # --- Handlers ---
+
+        def on_import(self):
+            """Import published footage (image sequence or movie) from a previous step."""
+            if self.host.importItem():
+                self.refresh_context()
 
         def on_sync(self):
             """Manually sync scene settings."""
@@ -243,18 +329,24 @@ def run_app():
             self.host.save(incremental=True)
             self.refresh_context()
 
+        def on_retrieve(self):
+            if self.host.restoreVersion():
+                self.refresh_context()
+
         def on_save_as(self):
             if self.host.saveAs():
                 self.refresh_context()
 
         def on_switch_shot(self):
-            if self.host.open():
-                self.refresh_context()
+            self.host.open()
             self.refresh_context()
 
         def on_status(self):
             if self.host.updateStatus():
-                self.refresh_header()
+                # Invalidate cached status data so the header shows the new state.
+                # DAEMON.setData() doesn't flush the getData() 2-second cache,
+                # so we clear it manually to force a fresh fetch.
+                ram.RamDaemonInterface.instance()._cache.pop('data', None)
             self.refresh_context()
 
         def on_check_update(self):
