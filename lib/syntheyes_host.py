@@ -126,6 +126,72 @@ class SynthEyesHost(RamHost):
         self.hlev.SetSNIFileName(self.normalizePath(fileName))
         return True
 
+    def collectItemSettings(self, item: RamItem) -> dict:
+        """Collects resolution and timing settings for the given item.
+
+        Optimized version using API methods to handle overrides correctly.
+        """
+        if not item:
+            return {}
+
+        project = RAMSES.project()
+        if not project:
+            return {}
+
+        settings = {
+            "width": int(project.width() or 1920),
+            "height": int(project.height() or 1080),
+            "framerate": float(project.framerate() or 24.0),
+            "duration": 0.0,
+            "pixelAspectRatio": float(project.pixelAspectRatio() or 1.0),
+        }
+
+        if item and item.itemType() == ItemType.SHOT:
+            from ramses import RamShot
+            shot = item if isinstance(item, RamShot) else RamShot(item.uuid())
+            settings["duration"] = float(shot.duration())
+            settings["frames"] = shot.frames()
+
+            seq = shot.sequence()
+            if seq:
+                settings["width"] = int(seq.width())
+                settings["height"] = int(seq.height())
+                settings["framerate"] = float(seq.framerate())
+                settings["pixelAspectRatio"] = float(seq.pixelAspectRatio())
+
+        return settings
+
+    def setupCurrentFile(self) -> None:
+        """Applies Ramses settings to the current scene."""
+        item = self.currentItem()
+        if item:
+            settings = self.collectItemSettings(item)
+            self._setupCurrentFile(item, self.currentStep(), settings)
+
+    def save(
+        self,
+        incremental: bool = False,
+        comment: str = None,
+        setupFile: bool = True,
+        state: RamState = None,
+    ) -> bool:
+        """Saves the current file, optionally setting up the scene."""
+        if setupFile:
+            self.setupCurrentFile()
+        else:
+            item = self.currentItem()
+            if item:
+                self._store_ramses_metadata(item, self.currentStep())
+
+        saveFilePath = self.saveFilePath()
+        if saveFilePath == "":
+            from ramses import Log
+            self._log(Log.MalformedName, LogLevel.Critical)
+            return self.saveAs()
+
+        state_short = state.shortName() if state else None
+        return self._RamHost__save(saveFilePath, incremental, comment, state_short)
+
     def _setupCurrentFile(self, item: RamItem, step: RamStep, setupOptions: dict) -> bool:
         """Sets the current file parameters (resolution, FPS, aspect)."""
         if not self.hlev:
@@ -159,6 +225,9 @@ class SynthEyesHost(RamHost):
                 duration = int(setupOptions["duration"])
                 self.hlev.SetAnimStart(start)
                 self.hlev.SetAnimEnd(start + duration - 1)
+
+            # Persist identity
+            self._store_ramses_metadata(item, step)
 
             return True
         except Exception as e:
