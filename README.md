@@ -4,16 +4,16 @@ Ramses integration for Boris FX SynthEyes.
 
 ## Installation
 
-1. Copy the `Ramses-Syntheyes` folder to your SynthEyes user scripts directory (or a location of your choice).
+1. Copy the `Ramses-Syntheyes` folder to your SynthEyes user scripts directory.
 2. Ensure you have a Python 3 environment installed with `PySide2` or `PySide6`.
 3. In SynthEyes, go to `Edit > Preferences > System` and ensure the `Python executable` points to your Python 3 install.
 
 ## Usage
 
 1. Run the script from the SynthEyes `Scripts` menu.
-2. The Ramses toolbar will appear.
+2. The plugin UI will appear.
 3. Use **Switch Shot / Task** to browse your Ramses project.
-4. If no SynthEyes file exists for a shot, the plugin will offer to create one automatically from the hero plate found in the pipeline.
+4. If no SynthEyes file exists for a shot, you can create one.
 
 ## Features
 

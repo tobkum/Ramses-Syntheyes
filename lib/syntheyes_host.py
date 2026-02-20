@@ -97,28 +97,41 @@ class SynthEyesHost(RamHost):
         if target_dir and not os.path.exists(target_dir):
             os.makedirs(target_dir, exist_ok=True)
 
+        old_path = self.normalizePath(self.hlev.SNIFileName() or "")
         try:
             # Set the target path then save. SaveIfChanged() is the correct
             # SyPy3 save method; after SetSNIFileName the scene is considered
             # modified (filename changed), so this always writes to the new path.
             self.hlev.SetSNIFileName(filePath)
             self.hlev.SaveIfChanged()
-            
+
             # Store metadata in a Note object if item is provided
             if item:
                 self._store_ramses_metadata(item, step)
-                
+
             return True
         except Exception as e:
             self._log(f"Failed to save: {e}", LogLevel.Critical)
+            # Rollback: restore original filename so SynthEyes isn't left
+            # pointing at an unwritten path.
+            try:
+                if old_path:
+                    self.hlev.SetSNIFileName(old_path)
+            except Exception:
+                pass
             return False
 
     def _open(self, filePath: str, item: RamItem, step: RamStep) -> bool:
         """Internal implementation to open an .sni file."""
-        if os.path.exists(filePath):
-            self.hlev.OpenSNI(self.normalizePath(filePath))
+        filePath = self.normalizePath(filePath)
+        if not os.path.exists(filePath):
+            return False
+        try:
+            self.hlev.OpenSNI(filePath)
             return True
-        return False
+        except Exception as e:
+            self._log(f"Failed to open scene: {e}", LogLevel.Critical)
+            return False
 
     def _setFileName(self, fileName: str) -> bool:
         """Sets the internal file name."""
@@ -155,19 +168,31 @@ class SynthEyesHost(RamHost):
 
             seq = shot.sequence()
             if seq:
-                settings["width"] = int(seq.width())
-                settings["height"] = int(seq.height())
-                settings["framerate"] = float(seq.framerate())
-                settings["pixelAspectRatio"] = float(seq.pixelAspectRatio())
+                seq_w = seq.width()
+                seq_h = seq.height()
+                seq_fps = seq.framerate()
+                seq_par = seq.pixelAspectRatio()
+                if seq_w:
+                    settings["width"] = int(seq_w)
+                if seq_h:
+                    settings["height"] = int(seq_h)
+                if seq_fps:
+                    settings["framerate"] = float(seq_fps)
+                    # Recompute frames using the sequence-overridden FPS so the
+                    # frame count is consistent with the effective framerate.
+                    settings["frames"] = round(settings["duration"] * float(seq_fps))
+                if seq_par:
+                    settings["pixelAspectRatio"] = float(seq_par)
 
         return settings
 
-    def setupCurrentFile(self) -> None:
-        """Applies Ramses settings to the current scene."""
+    def setupCurrentFile(self) -> bool:
+        """Applies Ramses settings to the current scene. Returns True on success."""
         item = self.currentItem()
         if item:
             settings = self.collectItemSettings(item)
-            self._setupCurrentFile(item, self.currentStep(), settings)
+            return self._setupCurrentFile(item, self.currentStep(), settings)
+        return False
 
     def save(
         self,
@@ -217,29 +242,28 @@ class SynthEyesHost(RamHost):
             # project.width() returns pixels, so we do NOT set it here —
             # SynthEyes reads resolution directly from the loaded footage.
 
-            # Frame range — SetAnimStart/End are UI controls, not shot
-            # attributes, so they live outside the shot undo block.
             self.hlev.AcceptShotChanges(shot, "Ramses: Setup Scene")
-
-            frames = int(setupOptions.get("frames", 0))
-            if not frames:
-                # Fallback: derive frame count from duration (seconds) × framerate
-                dur = float(setupOptions.get("duration", 0))
-                fps = float(setupOptions.get("framerate", 24.0))
-                frames = round(dur * fps)
-            if frames > 0:
-                start = RAM_SETTINGS.userSettings.get("compStartFrame", 1001)
-                self.hlev.SetAnimStart(start)
-                self.hlev.SetAnimEnd(start + frames - 1)
-
-            # Persist identity
-            self._store_ramses_metadata(item, step)
-
-            return True
         except Exception as e:
             self.hlev.Cancel()
             self._log(f"Failed to setup scene: {e}", LogLevel.Warning)
             return False
+
+        # Frame range — SetAnimStart/End are UI controls, not shot attributes,
+        # so they live outside the BeginShotChanges/AcceptShotChanges block.
+        frames = int(setupOptions.get("frames", 0))
+        if not frames:
+            # Fallback: derive frame count from duration (seconds) × framerate
+            dur = float(setupOptions.get("duration", 0))
+            fps = float(setupOptions.get("framerate", 24.0))
+            frames = round(dur * fps)
+        if frames > 0:
+            start = RAM_SETTINGS.userSettings.get("compStartFrame", 1001)
+            self.hlev.SetAnimStart(start)
+            self.hlev.SetAnimEnd(start + frames - 1)
+
+        # Persist identity
+        self._store_ramses_metadata(item, step)
+        return True
 
     def exportScene(self, exportType: str = "Blackmagic Fusion Comp") -> str:
         """Exports the scene to the Ramses publish folder."""
@@ -282,11 +306,12 @@ class SynthEyesHost(RamHost):
         if not self.hlev:
             return False
         
-        self.hlev.SaveIfChanged()
-        
+        if self.currentFilePath():
+            self.hlev.SaveIfChanged()
+
         # Get project settings
         project = item.project()
-        aspect = project.aspectRatio() if project else 1.777
+        aspect = project.aspectRatio() if project else (16.0 / 9.0)
         
         # Create new scene
         # filnm can be first image of sequence or movie
@@ -321,15 +346,18 @@ class SynthEyesHost(RamHost):
         if step:
             meta["StepUUID"] = str(step.uuid())
 
-        self.hlev.Begin()
+        began = False
         try:
+            self.hlev.Begin()
+            began = True
             if not note:
                 note = self.hlev.CreateNew("NOTE")
                 note.SetName(note_name)
             note.Set("text", json.dumps(meta))
             self.hlev.Accept("Ramses: Store Metadata")
         except Exception as e:
-            self.hlev.Cancel()
+            if began:
+                self.hlev.Cancel()
             self._log(f"Failed to store metadata: {e}", LogLevel.Warning)
 
     def currentItem(self) -> RamItem:
@@ -432,9 +460,10 @@ class SynthEyesHost(RamHost):
                         if plate_path:
                             # Use existing newShot method to initialize
                             if self.newShot(plate_path, item, step):
-                                # Return the newly created path so RamHost.open() finalizes
+                                # Do not return filePath — let RamHost.open() compute
+                                # the pipeline path via item.stepFilePath() and save
+                                # the new scene there via _saveAs().
                                 return {
-                                    "filePath": self.currentFilePath(),
                                     "item": item,
                                     "step": step,
                                 }
@@ -494,11 +523,18 @@ class SynthEyesHost(RamHost):
                 else:
                     res = dialog.exec_()
                 if res:
-                    return {
+                    result = {
                         "state": dialog.state(),
                         "comment": dialog.comment(),
-                        "completionRatio": dialog.completionRatio()
+                        "completionRatio": dialog.completionRatio(),
                     }
+                    if hasattr(dialog, 'publish'):
+                        result["publish"] = dialog.publish()
+                    if hasattr(dialog, 'savePreview'):
+                        result["savePreview"] = dialog.savePreview()
+                    if hasattr(dialog, 'showPublishUI'):
+                        result["showPublishUI"] = dialog.showPublishUI()
+                    return result
                 return None
             except ImportError:
                 pass
