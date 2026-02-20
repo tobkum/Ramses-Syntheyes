@@ -88,9 +88,10 @@ class SynthEyesHost(RamHost):
             os.makedirs(target_dir, exist_ok=True)
 
         try:
-            # In SynthEyes, we set the filename and then trigger a save action or menu click
+            # In SynthEyes, we set the filename and then trigger a save action.
+            # SaveSNI() is the most robust SyPy method for this.
             self.hlev.SetSNIFileName(filePath)
-            self.hlev.ClickTopMenuAndWait("File", "Save")
+            self.hlev.SaveSNI()
             
             # Store metadata in a Note object if item is provided
             if item:

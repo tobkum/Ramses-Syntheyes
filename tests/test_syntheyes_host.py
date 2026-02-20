@@ -53,7 +53,7 @@ class TestSynthEyesHost(unittest.TestCase):
         
         self.assertTrue(success)
         self.mock_hlev.SetSNIFileName.assert_called_with("D:/Work/new_track.sni")
-        self.mock_hlev.ClickTopMenuAndWait.assert_called_with("File", "Save")
+        self.mock_hlev.SaveSNI.assert_called_once()
 
     def test_open_logic(self):
         """Verify that _open correctly calls OpenSNI."""
