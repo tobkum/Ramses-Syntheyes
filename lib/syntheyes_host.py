@@ -21,6 +21,12 @@ class SynthEyesHost(RamHost):
     Ramses Host implementation for Boris FX SynthEyes.
     """
 
+    # Identity Properties
+    name = "Ramses-Syntheyes"
+    vendorName = "Overmind Studios"
+    version = "1.0.0"
+    helpURL = "https://www.overmind-studios.de"
+
     def __init__(self, hlev_obj: object) -> None:
         super().__init__()
         self.hlev = hlev_obj
