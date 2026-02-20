@@ -137,7 +137,11 @@ def run_app():
             self.ramses.host = self.host
             self.host.app = self  # Required: dialog methods check hasattr(self, 'app')
             self.hlev = hlev
-            
+
+            # Cache for currentItem/currentStep — keyed by file path so we
+            # only call the daemon when the open scene actually changes.
+            self._context_cache = {"filePath": None, "item": None, "step": None}
+
             self.setWindowTitle("Ramses - SynthEyes")
             self.setStyleSheet(
                 "QMainWindow { background-color: #1a1a1a; }"
@@ -240,8 +244,16 @@ def run_app():
 
         def refresh_context(self):
             """Updates the context label and button states based on current file."""
-            item = self.host.currentItem()
-            step = self.host.currentStep()
+            # currentItem() and currentStep() may call the Ramses daemon.
+            # Cache them by file path — only re-query when the scene changes.
+            current_path = self.host.currentFilePath()
+            if current_path != self._context_cache["filePath"]:
+                self._context_cache["filePath"] = current_path
+                self._context_cache["item"] = self.host.currentItem()
+                self._context_cache["step"] = self.host.currentStep()
+
+            item = self._context_cache["item"]
+            step = self._context_cache["step"]
             in_pipeline = bool(item and item.uuid() and step)
 
             if in_pipeline:
@@ -390,6 +402,22 @@ def run_app():
     app = qw.QApplication.instance()
     if not app:
         app = qw.QApplication(sys.argv)
+
+    # Warn if the Ramses daemon is unreachable — do this before creating the
+    # window so the dialog appears before the panel, not buried behind it.
+    try:
+        daemon = ram.RamDaemonInterface.instance()
+        if not daemon.online():
+            qw.QMessageBox.warning(
+                None,
+                "Ramses Not Connected",
+                "Could not connect to the Ramses daemon.\n\n"
+                "Pipeline features (item tracking, status updates, publish) "
+                "will not be available until the Ramses application is running.\n\n"
+                "Start the Ramses application, then click 'Browse Shots' to reconnect.",
+            )
+    except Exception:
+        pass  # Best-effort check; don't block startup
 
     main_win = RamsesSyntheyesApp(hlev)
     main_win.show()

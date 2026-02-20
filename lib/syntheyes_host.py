@@ -99,15 +99,17 @@ class SynthEyesHost(RamHost):
 
         old_path = self.normalizePath(self.hlev.SNIFileName() or "")
         try:
+            # Store metadata BEFORE saving so the Note is included in the
+            # written file. Abort if metadata fails — saving without Ramses
+            # identity would leave a file that is invisible to the pipeline.
+            if item and not self._store_ramses_metadata(item, step):
+                return False
+
             # Set the target path then save. SaveIfChanged() is the correct
             # SyPy3 save method; after SetSNIFileName the scene is considered
             # modified (filename changed), so this always writes to the new path.
             self.hlev.SetSNIFileName(filePath)
             self.hlev.SaveIfChanged()
-
-            # Store metadata in a Note object if item is provided
-            if item:
-                self._store_ramses_metadata(item, step)
 
             return True
         except Exception as e:
@@ -319,12 +321,11 @@ class SynthEyesHost(RamHost):
         
         if res:
             self._setupCurrentFile(item, step, self.collectItemSettings(item))
-            self._store_ramses_metadata(item, step)
             return True
             
         return False
 
-    def _store_ramses_metadata(self, item: RamItem, step: RamStep = None):
+    def _store_ramses_metadata(self, item: RamItem, step: RamStep = None) -> bool:
         """Stores Ramses identity in a hidden Note.
 
         Both the optional CreateNew and the Set must be inside a single
@@ -332,9 +333,11 @@ class SynthEyesHost(RamHost):
         The Note attribute 'text' is the standard Sizzle content field;
         if the installed SynthEyes version uses a different name the except
         branch will log the failure without crashing the save workflow.
+
+        Returns True on success, False on failure.
         """
         if not self.hlev:
-            return
+            return False
 
         note_name = "RamsesMetadata"
         note = self.hlev.FindByName("NOTE", note_name)
@@ -355,10 +358,12 @@ class SynthEyesHost(RamHost):
                 note.SetName(note_name)
             note.Set("text", json.dumps(meta))
             self.hlev.Accept("Ramses: Store Metadata")
+            return True
         except Exception as e:
             if began:
                 self.hlev.Cancel()
             self._log(f"Failed to store metadata: {e}", LogLevel.Warning)
+            return False
 
     def currentItem(self) -> RamItem:
         """Gets current item, recovery via Note metadata if needed."""
@@ -376,11 +381,17 @@ class SynthEyesHost(RamHost):
                         real_item = RamShot(item_uuid)
                         if real_item.shortName() == "Unknown":
                             real_item = RamAsset(item_uuid)
-                        
+
                         if real_item.shortName() != "Unknown":
                             return real_item
-                except Exception:
-                    pass
+                        else:
+                            self._log(
+                                f"Metadata note found but item UUID '{item_uuid}' "
+                                "not found in Ramses (shot or asset).",
+                                LogLevel.Warning,
+                            )
+                except Exception as e:
+                    self._log(f"Failed to recover item from metadata note: {e}", LogLevel.Warning)
         return item
 
     def currentStep(self) -> RamStep:
@@ -447,9 +458,14 @@ class SynthEyesHost(RamHost):
                         qw.QMessageBox.Yes | qw.QMessageBox.No)
                     
                     if res_new == qw.QMessageBox.Yes:
-                        # Search for plate
+                        # Search for plate — step names are configurable via
+                        # RAM_SETTINGS.userSettings["plateStepNames"]
                         plate_path = ""
-                        for step_name in ["Plate", "Ingest", "Footage"]:
+                        default_plate_steps = ["Plate", "Ingest", "Footage"]
+                        plate_step_names = RAM_SETTINGS.userSettings.get(
+                            "plateStepNames", default_plate_steps
+                        )
+                        for step_name in plate_step_names:
                             p_step = project.step(step_name)
                             if p_step:
                                 pub_files = item.latestPublishedVersionFilePaths(step=p_step)
@@ -657,7 +673,8 @@ class SynthEyesHost(RamHost):
             if render_compression_override:
                 shot.Set("renderCompression", old_render_compression)
             self.hlev.AcceptShotChanges(shot, "Ramses: Restore Render Settings")
-        except Exception:
+        except Exception as e:
+            self._log(f"Failed to restore render settings after preview: {e}", LogLevel.Warning)
             self.hlev.Cancel()
 
         if not render_ok:
