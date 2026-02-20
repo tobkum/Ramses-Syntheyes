@@ -572,7 +572,103 @@ class SynthEyesHost(RamHost):
         return None
 
     def _preview(self, previewFolderPath: str, previewFileBaseName: str, item: RamItem, step: RamStep) -> list:
-        raise NotImplementedError("Preview is not supported for SynthEyes tracking scenes.")
+        """Renders the tracking overlay sequence to disk via SynthEyes' Save Sequence.
+
+        The output format is determined by the 'previewFormat' publish option
+        (file extension).  Image sequences: jpg, png, exr, dpx, tif.
+        Movies (platform-dependent): avi, mov, mp4.
+
+        Advanced: 'previewRenderSettings' and 'previewRenderCompression' can
+        override the opaque strings SynthEyes uses for channel selection and
+        codec.  Leave them empty to use whatever is already configured in the
+        scene.  To discover the correct values: configure the render manually
+        in SynthEyes, then read back:
+            hlev.Shots()[0].Get("renderSettings")
+            hlev.Shots()[0].Get("renderCompression")
+        """
+        if not self.hlev:
+            return []
+
+        shots = self.hlev.Shots()
+        if not shots:
+            return []
+        shot = shots[0]
+
+        # Read publish options (step settings merged with defaults)
+        step_opts = {}
+        if step:
+            try:
+                step_opts = step.publishSettings('yaml') or {}
+                if not isinstance(step_opts, dict):
+                    step_opts = {}
+            except Exception:
+                step_opts = {}
+        options = self._publishOptions(step_opts, False)
+
+        ext = options.get("previewFormat", "jpg").lstrip(".")
+        render_settings_override = options.get("previewRenderSettings", "")
+        render_compression_override = options.get("previewRenderCompression", "")
+
+        # Build the output path — SynthEyes appends frame numbers for sequences
+        os.makedirs(previewFolderPath, exist_ok=True)
+        render_file = self.normalizePath(
+            os.path.join(previewFolderPath, f"{previewFileBaseName}.{ext}")
+        )
+
+        # Capture current shot render settings so we can restore them afterward
+        try:
+            old_render_file = shot.Get("renderFile") or ""
+            old_render_settings = shot.Get("renderSettings") or ""
+            old_render_compression = shot.Get("renderCompression") or ""
+        except Exception:
+            old_render_file = old_render_settings = old_render_compression = ""
+
+        # Apply preview output path (and optional overrides) in a shot undo block
+        self.hlev.BeginShotChanges(shot)
+        try:
+            shot.Set("renderFile", render_file)
+            if render_settings_override:
+                shot.Set("renderSettings", render_settings_override)
+            if render_compression_override:
+                shot.Set("renderCompression", render_compression_override)
+            self.hlev.AcceptShotChanges(shot, "Ramses: Configure Preview Render")
+        except Exception as e:
+            self.hlev.Cancel()
+            self._log(f"Failed to configure preview render: {e}", LogLevel.Warning)
+            return []
+
+        # Snapshot directory before rendering
+        before = set(os.listdir(previewFolderPath))
+
+        # Render — blocks until complete or cancelled
+        render_ok = False
+        try:
+            self.hlev.RenderShot(shot)
+            render_ok = True
+        except Exception as e:
+            self._log(f"Preview render failed: {e}", LogLevel.Critical)
+
+        # Restore original render settings regardless of render success
+        self.hlev.BeginShotChanges(shot)
+        try:
+            shot.Set("renderFile", old_render_file)
+            if render_settings_override:
+                shot.Set("renderSettings", old_render_settings)
+            if render_compression_override:
+                shot.Set("renderCompression", old_render_compression)
+            self.hlev.AcceptShotChanges(shot, "Ramses: Restore Render Settings")
+        except Exception:
+            self.hlev.Cancel()
+
+        if not render_ok:
+            return []
+
+        # Return the list of newly created files
+        after = set(os.listdir(previewFolderPath))
+        return sorted(
+            os.path.join(previewFolderPath, f)
+            for f in (after - before)
+        )
 
     def _publish(self, publishInfo: RamFileInfo, publishOptions: dict) -> list:
         """Exports tracking data to the publish folder using SynthEyes Export."""
@@ -602,7 +698,26 @@ class SynthEyesHost(RamHost):
 
     def _publishOptions(self, proposedOptions: dict, showPublishUI: bool = False) -> dict:
         """Shows a UI to edit the publish options (YAML) if requested."""
-        defaults = {"exportType": "Blackmagic Fusion Comp"}
+        defaults = {
+            # Tracking data export ─────────────────────────────────────────────
+            # Name from SynthEyes File › Export menu.
+            "exportType": "Blackmagic Fusion Comp",
+
+            # Preview / Save-Sequence render ───────────────────────────────────
+            # File extension that controls the output format:
+            #   Image sequences : jpg  png  exr  dpx  tif
+            #   Movies (OS-dependent) : avi  mov  mp4
+            "previewFormat": "jpg",
+
+            # Advanced: override the opaque SynthEyes channel-selection and
+            # codec strings.  Leave empty to use whatever is already
+            # configured in the scene.
+            # To find the values: set up the render in SynthEyes, then read:
+            #   hlev.Shots()[0].Get("renderSettings")
+            #   hlev.Shots()[0].Get("renderCompression")
+            "previewRenderSettings": "",
+            "previewRenderCompression": "",
+        }
         options = {**defaults, **(proposedOptions or {})}
         if not showPublishUI:
             return options
@@ -613,13 +728,21 @@ class SynthEyesHost(RamHost):
         except Exception:
             current_yaml = ""
 
+        yaml_label = (
+            "Settings (YAML):\n\n"
+            "exportType         — name from SynthEyes File › Export menu\n"
+            "previewFormat      — image seq: jpg png exr dpx tif  |  movie: avi mov mp4\n"
+            "previewRenderSettings    — advanced: SynthEyes channel string (empty = scene default)\n"
+            "previewRenderCompression — advanced: SynthEyes codec string   (empty = scene default)"
+        )
+
         # Using standard _request_input (UIManager or SyPy fallback)
         res = self._request_input(
             "Edit Publish Settings",
             [
                 {
                     "id": "YAML",
-                    "label": "Settings (YAML):",
+                    "label": yaml_label,
                     "type": "text",
                     "default": current_yaml,
                     "lines": 20,

@@ -322,7 +322,7 @@ def run_app():
 
         def on_export(self):
             """Export tracking data via the Ramses publish lifecycle."""
-            self.host.publish(showPublishUI=True)
+            self.host.publish(forceShowPublishUI=True)
             self.refresh_context()
 
         def on_open(self):
