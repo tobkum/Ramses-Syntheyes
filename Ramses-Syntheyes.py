@@ -114,7 +114,8 @@ def run_app():
     from ramses_ui_pyside.about_dialog import RamAboutDialog
     from ramses_ui_pyside.import_dialog import RamImportDialog
     from ramses_ui_pyside.update_dialog import RamUpdateDialog
-        class RamsesSyntheyesApp(qw.QMainWindow):
+
+    class RamsesSyntheyesApp(qw.QMainWindow):
         """The main application window for the Ramses SynthEyes integration."""
 
         def __init__(self, hlev: object) -> None:
