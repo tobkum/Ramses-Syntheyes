@@ -2,6 +2,10 @@
 import os
 import re
 import json
+try:
+    import ramses.yaml as yaml
+except ImportError:
+    import yaml
 from ramses import (
     RamHost,
     RamItem,
@@ -466,7 +470,40 @@ class SynthEyesHost(RamHost):
         return []
 
     def _publishOptions(self, proposedOptions: dict, showPublishUI: bool = False) -> dict:
-        return proposedOptions
+        """Shows a UI to edit the publish options (YAML) if requested."""
+        if not showPublishUI:
+            return proposedOptions or {}
+
+        # Convert dict to YAML for editing
+        try:
+            current_yaml = yaml.dump(proposedOptions, default_flow_style=False)
+        except Exception:
+            current_yaml = ""
+
+        # Using standard _request_input (UIManager or SyPy fallback)
+        res = self._request_input(
+            "Edit Publish Settings",
+            [
+                {
+                    "id": "YAML",
+                    "label": "Settings (YAML):",
+                    "type": "text",
+                    "default": current_yaml,
+                    "lines": 20,
+                }
+            ],
+        )
+
+        if res is not None:
+            try:
+                new_options = yaml.safe_load(res["YAML"])
+                return new_options if isinstance(new_options, dict) else {}
+            except Exception as e:
+                # On error, warn and show UI again (recursion)
+                self._log(f"Invalid YAML Settings: {e}", LogLevel.Warning)
+                return self._publishOptions(proposedOptions, True)
+
+        return None  # User cancelled
 
     def _prePublish(self, publishInfo: RamFileInfo, publishOptions: dict) -> dict:
         return publishOptions
