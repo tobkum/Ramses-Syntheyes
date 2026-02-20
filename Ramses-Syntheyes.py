@@ -23,8 +23,13 @@ def _acquire_instance_lock() -> bool:
             os.kill(pid, 0)   # signal 0: raises OSError if process is gone
             print(f"Ramses SynthEyes plugin is already running (PID {pid}).")
             return False
+        except PermissionError:
+            # On Windows, PermissionError means the process IS running
+            # (different user or insufficient permissions to signal it).
+            print(f"Ramses SynthEyes plugin is already running (PID {pid}).")
+            return False
         except (OSError, ValueError):
-            pass  # stale lock from a crashed previous run
+            pass  # ProcessLookupError (process gone) or bad pid in lock file
     with open(_LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
     return True
@@ -50,12 +55,14 @@ def run_app():
             print("SyPy found in system site-packages.")
         except ImportError:
             # Expanded search paths
-            possible_paths = [
-                r"C:\Program Files\BorisFX\SynthEyes 2026",
-                r"C:\Program Files\Boris FX\SynthEyes 2026",
-                r"C:\Program Files\SynthEyes 2026",
-                r"C:\Program Files\SynthEyes",
-            ]
+            possible_paths = []
+            for _year in [2026, 2025, 2024, 2023]:
+                possible_paths += [
+                    rf"C:\Program Files\BorisFX\SynthEyes {_year}",
+                    rf"C:\Program Files\Boris FX\SynthEyes {_year}",
+                    rf"C:\Program Files\SynthEyes {_year}",
+                ]
+            possible_paths.append(r"C:\Program Files\SynthEyes")
             
             # Try to infer from the script path (AppData version)
             # Script: ...\AppData\Local\BorisFX\SynthEyes 2026\scripts\...
@@ -184,7 +191,7 @@ def run_app():
             layout.addSpacing(8)
 
             # Group 3: Publish (green — #2a422a)
-            self.btn_export = self.create_button("Export to Pipeline", "rampreview.png", self.on_export, "#2a422a")
+            self.btn_export = self.create_button("Export to Pipeline", "rampublishsettings.png", self.on_export, "#2a422a")
             layout.addWidget(self.btn_export)
             self.btn_status = self.create_button("Update Status", "ramstatus.png", self.on_status, "#2a422a")
             layout.addWidget(self.btn_status)
@@ -308,14 +315,15 @@ def run_app():
 
         def on_sync(self):
             """Manually sync scene settings."""
-            self.host.setupCurrentFile()
-            qw.QMessageBox.information(self, "Ramses", "Scene settings synced with database.")
+            if self.host.setupCurrentFile():
+                qw.QMessageBox.information(self, "Ramses", "Scene settings synced with database.")
+            else:
+                qw.QMessageBox.warning(self, "Ramses", "Could not sync scene settings.\nMake sure a Ramses shot is active.")
 
         def on_export(self):
-            """Export tracking data."""
-            path = self.host.exportScene()
-            if path:
-                qw.QMessageBox.information(self, "Export Successful", f"Tracking data exported to:\n{path}")
+            """Export tracking data via the Ramses publish lifecycle."""
+            self.host.publish(showPublishUI=True)
+            self.refresh_context()
 
         def on_open(self):
             if self.host.open():
@@ -338,8 +346,8 @@ def run_app():
                 self.refresh_context()
 
         def on_switch_shot(self):
-            self.host.open()
-            self.refresh_context()
+            if self.host.open():
+                self.refresh_context()
 
         def on_status(self):
             if self.host.updateStatus():

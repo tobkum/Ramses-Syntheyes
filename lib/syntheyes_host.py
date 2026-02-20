@@ -572,19 +572,44 @@ class SynthEyesHost(RamHost):
         return None
 
     def _preview(self, previewFolderPath: str, previewFileBaseName: str, item: RamItem, step: RamStep) -> list:
-        return []
+        raise NotImplementedError("Preview is not supported for SynthEyes tracking scenes.")
 
     def _publish(self, publishInfo: RamFileInfo, publishOptions: dict) -> list:
-        return []
+        """Exports tracking data to the publish folder using SynthEyes Export."""
+        if not self.hlev:
+            return []
+
+        options = publishOptions or {}
+        export_type = options.get("exportType", "Blackmagic Fusion Comp")
+        ext = "comp" if "Fusion" in export_type else "txt"
+
+        publishInfo.extension = ext
+        if not publishInfo.resource:
+            publishInfo.resource = "tracking"
+
+        export_path = self.normalizePath(publishInfo.filePath())
+        target_dir = os.path.dirname(export_path)
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+
+        try:
+            self.hlev.Export(export_type, export_path)
+            self._log(f"Exported {export_type} to: {export_path}", LogLevel.Info)
+            return [export_path]
+        except Exception as e:
+            self._log(f"Export failed: {e}", LogLevel.Critical)
+            return []
 
     def _publishOptions(self, proposedOptions: dict, showPublishUI: bool = False) -> dict:
         """Shows a UI to edit the publish options (YAML) if requested."""
+        defaults = {"exportType": "Blackmagic Fusion Comp"}
+        options = {**defaults, **(proposedOptions or {})}
         if not showPublishUI:
-            return proposedOptions or {}
+            return options
 
         # Convert dict to YAML for editing
         try:
-            current_yaml = yaml.dump(proposedOptions, default_flow_style=False)
+            current_yaml = yaml.dump(options, default_flow_style=False)
         except Exception:
             current_yaml = ""
 
@@ -609,7 +634,7 @@ class SynthEyesHost(RamHost):
             except Exception as e:
                 # On error, warn and show UI again (recursion)
                 self._log(f"Invalid YAML Settings: {e}", LogLevel.Warning)
-                return self._publishOptions(proposedOptions, True)
+                return self._publishOptions(options, True)
 
         return None  # User cancelled
 
@@ -639,15 +664,15 @@ class SynthEyesHost(RamHost):
                 pass
         return ""
 
-    def _saveChangesUI(self) -> bool:
+    def _saveChangesUI(self) -> str:
         """Asks the user whether to save unsaved changes before switching scenes.
-        Returns False if the user cancels, True otherwise (saving if requested).
+        Returns 'cancel', 'save', or 'discard' as expected by RamHost.open().
         """
         try:
             try:
-                from PySide6.QtWidgets import QMessageBox
-            except ImportError:
                 from PySide2.QtWidgets import QMessageBox
+            except ImportError:
+                from PySide6.QtWidgets import QMessageBox
             reply = QMessageBox.question(
                 None,
                 "Unsaved Changes",
@@ -656,32 +681,10 @@ class SynthEyesHost(RamHost):
                 QMessageBox.Save,
             )
             if reply == QMessageBox.Cancel:
-                return False
+                return 'cancel'
             if reply == QMessageBox.Save:
-                self.save()
-            return True
+                return 'save'
+            return 'discard'
         except Exception:
-            return True  # Fallback: allow proceeding if Qt is unavailable
+            return 'discard'  # Fallback: allow proceeding without saving
 
-    def isSynthEyesStep(self, step: RamStep) -> bool:
-        """Determines if a given Step is configured for SynthEyes."""
-        if not step:
-            return False
-
-        # 1. Check Step Naming (including MaMo)
-        short = step.shortName().upper()
-        if any(x in short for x in ["TRACK", "MATCHMOVE", "MAMO", "SYPY", "SYNTHEYES"]):
-            return True
-
-        # 2. Check Linked Applications
-        daemon = RAMSES.daemonInterface()
-        s_data = step.data()
-        apps = s_data.get("applications", [])
-        if isinstance(apps, list):
-            for app_uuid in apps:
-                app_data = daemon.getData(str(app_uuid), "RamApplication")
-                app_name = str(app_data.get("name", "")).upper()
-                if "SYNTHEYES" in app_name:
-                    return True
-
-        return False
