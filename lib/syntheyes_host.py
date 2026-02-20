@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 import os
-import re
-import json
 try:
     import ramses.yaml as yaml
 except ImportError:
@@ -99,17 +97,17 @@ class SynthEyesHost(RamHost):
 
         old_path = self.normalizePath(self.hlev.SNIFileName() or "")
         try:
-            # Store metadata BEFORE saving so the Note is included in the
-            # written file. Abort if metadata fails — saving without Ramses
-            # identity would leave a file that is invisible to the pipeline.
-            if item and not self._store_ramses_metadata(item, step):
-                return False
-
             # Set the target path then save. SaveIfChanged() is the correct
             # SyPy3 save method; after SetSNIFileName the scene is considered
             # modified (filename changed), so this always writes to the new path.
             self.hlev.SetSNIFileName(filePath)
             self.hlev.SaveIfChanged()
+
+            # Write sidecar metadata AFTER the file exists on disk —
+            # RamMetaDataManager requires the file to be present (it prunes
+            # entries for missing files on every read).
+            if item:
+                self._store_ramses_metadata(item, step, filePath)
 
             return True
         except Exception as e:
@@ -127,6 +125,27 @@ class SynthEyesHost(RamHost):
         """Internal implementation to open an .sni file."""
         filePath = self.normalizePath(filePath)
         if not os.path.exists(filePath):
+            # File doesn't exist yet — this happens when _openUI returned a new
+            # scene created via newShot() without a filePath key, causing the
+            # base class to compute the pipeline path and call us with it.
+            # Always consume the pending flags here — they are only valid for
+            # the single _open() call that immediately follows newShot().
+            pending = getattr(self, "_pending_new_shot_item", None)
+            pending_step = getattr(self, "_pending_new_shot_step", None)
+            self._pending_new_shot_item = None
+            self._pending_new_shot_step = None
+            if pending and item and pending.uuid() == item.uuid():
+                target_dir = os.path.dirname(filePath)
+                if target_dir:
+                    os.makedirs(target_dir, exist_ok=True)
+                try:
+                    self.hlev.SetSNIFileName(filePath)
+                    self.hlev.SaveIfChanged()
+                    # Write sidecar now that the file is on disk
+                    self._store_ramses_metadata(item, step or pending_step, filePath)
+                    return True
+                except Exception as e:
+                    self._log(f"Failed to save new scene to pipeline path: {e}", LogLevel.Critical)
             return False
         try:
             self.hlev.OpenSNI(filePath)
@@ -267,117 +286,82 @@ class SynthEyesHost(RamHost):
         self._store_ramses_metadata(item, step)
         return True
 
-    def exportScene(self, exportType: str = "Blackmagic Fusion Comp") -> str:
-        """Exports the scene to the Ramses publish folder."""
-        if not self.hlev:
-            return ""
-            
-        item = self.currentItem()
-        step = self.currentStep()
-        if not item or not step:
-            self._log("Cannot export: File not in Ramses pipeline.", LogLevel.Warning)
-            return ""
-
-        # Determine extension based on type
-        ext = "comp" if "Fusion" in exportType else "txt"
-        
-        # Get publish path via Ramses API
-        publish_info = self.publishInfo()
-        publish_info.extension = ext
-        # Add '-tracking' resource suffix
-        if publish_info.resource:
-            publish_info.resource += "-tracking"
-        else:
-            publish_info.resource = "tracking"
-            
-        export_path = self.normalizePath(publish_info.filePath())
-        
-        # Ensure directory
-        os.makedirs(os.path.dirname(export_path), exist_ok=True)
-        
-        try:
-            self.hlev.Export(exportType, export_path)
-            self._log(f"Exported {exportType} to: {export_path}", LogLevel.Info)
-            return export_path
-        except Exception as e:
-            self._log(f"Export failed: {e}", LogLevel.Critical)
-            return ""
-
     def newShot(self, footagePath: str, item: RamItem, step: RamStep) -> bool:
         """Creates a new scene with the specified footage."""
         if not self.hlev:
             return False
-        
+
         if self.currentFilePath():
             self.hlev.SaveIfChanged()
 
         # Get project settings
         project = item.project()
         aspect = project.aspectRatio() if project else (16.0 / 9.0)
-        
+
         # Create new scene
         # filnm can be first image of sequence or movie
         res = self.hlev.NewSceneAndShot(self.normalizePath(footagePath), aspect)
-        
+
         if res:
-            self._setupCurrentFile(item, step, self.collectItemSettings(item))
+            # Remember which item/step this scene is for so _open() can write
+            # the sidecar once the pipeline file path is known and saved.
+            self._pending_new_shot_item = item
+            self._pending_new_shot_step = step
+            if not self._setupCurrentFile(item, step, self.collectItemSettings(item)):
+                self._log(
+                    "Scene created but settings (FPS, frame range) could not be applied.",
+                    LogLevel.Warning,
+                )
             return True
-            
+
         return False
 
-    def _store_ramses_metadata(self, item: RamItem, step: RamStep = None) -> bool:
-        """Stores Ramses identity in a hidden Note.
+    def _store_ramses_metadata(
+        self, item: RamItem, step: RamStep = None, filePath: str = None
+    ) -> bool:
+        """Stores Ramses identity (item/step UUIDs) in the Ramses sidecar file.
 
-        Both the optional CreateNew and the Set must be inside a single
-        Begin/Accept block — SyObj.Set() requires an active undo context.
-        The Note attribute 'text' is the standard Sizzle content field;
-        if the installed SynthEyes version uses a different name the except
-        branch will log the failure without crashing the save workflow.
+        Uses RamMetaDataManager to write a JSON sidecar (_ramses_data.json) in
+        the same folder as the .sni file.  The sidecar must be written AFTER
+        the .sni file exists on disk; when called before the file is saved
+        (e.g. from _setupCurrentFile on a brand-new scene), the write is
+        deferred and this method returns True without doing anything — the write
+        will happen in _saveAs() once the file exists.
 
-        Returns True on success, False on failure.
+        Returns True on success (or deferred write), False on I/O failure.
         """
-        if not self.hlev:
-            return False
-
-        note_name = "RamsesMetadata"
-        note = self.hlev.FindByName("NOTE", note_name)
+        path = filePath or self.currentFilePath()
+        if not path or not os.path.isfile(path):
+            # File not yet on disk — metadata will be written by _saveAs().
+            return True
 
         meta = {
-            "ItemUUID": str(item.uuid()),
-            "ProjectUUID": str(item.project().uuid()) if item.project() else "",
+            "itemUUID": str(item.uuid()),
+            "projectUUID": str(item.project().uuid()) if item.project() else "",
         }
         if step:
-            meta["StepUUID"] = str(step.uuid())
+            meta["stepUUID"] = str(step.uuid())
 
-        began = False
         try:
-            self.hlev.Begin()
-            began = True
-            if not note:
-                note = self.hlev.CreateNew("NOTE")
-                note.SetName(note_name)
-            note.Set("text", json.dumps(meta))
-            self.hlev.Accept("Ramses: Store Metadata")
+            RamMetaDataManager.setValue(path, "ramses", meta)
             return True
         except Exception as e:
-            if began:
-                self.hlev.Cancel()
             self._log(f"Failed to store metadata: {e}", LogLevel.Warning)
             return False
 
     def currentItem(self) -> RamItem:
-        """Gets current item, recovery via Note metadata if needed."""
+        """Gets current item, recovery via sidecar metadata if needed."""
         item = super().currentItem()
-        
-        if (not item or item.virtual()) and self.hlev:
-            note = self.hlev.FindByName("NOTE", "RamsesMetadata")
-            if note:
+
+        if not item or item.virtual():
+            path = self.currentFilePath()
+            if path:
                 try:
-                    meta = json.loads(note.Get("text"))
-                    item_uuid = meta.get("ItemUUID")
+                    meta = RamMetaDataManager.getValue(path, "ramses") or {}
+                    item_uuid = meta.get("itemUUID")
                     if item_uuid:
                         from ramses import RamShot, RamAsset
-                        # Try shot first for tracking
+                        # Try shot first (most common for tracking)
                         real_item = RamShot(item_uuid)
                         if real_item.shortName() == "Unknown":
                             real_item = RamAsset(item_uuid)
@@ -386,24 +370,24 @@ class SynthEyesHost(RamHost):
                             return real_item
                         else:
                             self._log(
-                                f"Metadata note found but item UUID '{item_uuid}' "
+                                f"Sidecar metadata found but item UUID '{item_uuid}' "
                                 "not found in Ramses (shot or asset).",
                                 LogLevel.Warning,
                             )
                 except Exception as e:
-                    self._log(f"Failed to recover item from metadata note: {e}", LogLevel.Warning)
+                    self._log(f"Failed to recover item from sidecar metadata: {e}", LogLevel.Warning)
         return item
 
     def currentStep(self) -> RamStep:
-        """Gets current step, recovery via Note metadata if needed."""
+        """Gets current step, recovery via sidecar metadata if needed."""
         step = super().currentStep()
-        
-        if (not step or step.shortName() == "Unknown") and self.hlev:
-            note = self.hlev.FindByName("NOTE", "RamsesMetadata")
-            if note:
+
+        if not step or step.shortName() == "Unknown":
+            path = self.currentFilePath()
+            if path:
                 try:
-                    meta = json.loads(note.Get("text"))
-                    step_uuid = meta.get("StepUUID")
+                    meta = RamMetaDataManager.getValue(path, "ramses") or {}
+                    step_uuid = meta.get("stepUUID")
                     if step_uuid:
                         real_step = RamStep(step_uuid)
                         if real_step.shortName() != "Unknown":
@@ -442,6 +426,9 @@ class SynthEyesHost(RamHost):
                 path = dialog.filePath()
                 item = dialog.currentItem()
                 step = dialog.currentStep()
+                # Re-fetch project from the dialog selection — the user may have
+                # picked a shot from a different project than RAMSES.project().
+                project = item.project() if item else project
 
                 # 1. Existing File path found
                 if path and os.path.exists(path):
@@ -450,7 +437,7 @@ class SynthEyesHost(RamHost):
                         "item": item,
                         "step": step,
                     }
-                
+
                 # 2. No file on disk, but user selected a shot/step context
                 if item and step:
                     res_new = qw.QMessageBox.question(None, "New SynthEyes Scene", 
@@ -568,7 +555,12 @@ class SynthEyesHost(RamHost):
         if not self.hlev or not filePaths:
             return False
         footage_path = self.normalizePath(filePaths[0])
-        return self.newShot(footage_path, item, step)
+        result = self.newShot(footage_path, item, step)
+        # importItem() does not call _open(), so clear the pending flags that
+        # newShot() set — they only make sense for the _openUI → _open() path.
+        self._pending_new_shot_item = None
+        self._pending_new_shot_step = None
+        return result
 
     def _importUI(self, item: RamItem, step: RamStep) -> dict:
         if hasattr(self, 'app') and self.app:
