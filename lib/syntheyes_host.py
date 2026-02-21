@@ -819,7 +819,8 @@ class SynthEyesHost(RamHost):
                     except Exception:
                         pass
 
-                    self.hlev.ReloadAll()
+                    # NOTE: ReloadAll() sends RELOADALL which clears HasChanged.
+                    # Use Redraw() only so the dirty flag set by AddShot() survives.
                     self.hlev.Redraw()
 
                     if hasattr(self, "app") and self.app:
