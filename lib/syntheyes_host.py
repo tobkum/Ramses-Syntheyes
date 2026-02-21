@@ -624,6 +624,7 @@ class SynthEyesHost(RamHost):
         )
 
         # Capture current shot render settings so we can restore them afterward
+        self._log("Preview: reading current render settings...", LogLevel.Info)
         try:
             old_render_file = shot.Get("renderFile") or ""
             old_render_settings = shot.Get("renderSettings") or ""
@@ -631,43 +632,62 @@ class SynthEyesHost(RamHost):
         except Exception:
             old_render_file = old_render_settings = old_render_compression = ""
 
-        # Apply preview output path (and optional overrides) in a shot undo block
-        self.hlev.BeginShotChanges(shot)
+        # Apply preview output path (and optional overrides).
+        # Use Begin/Accept (not BeginShotChanges/AcceptShotChanges) because
+        # renderFile is a pure output setting — it does not invalidate the RAM
+        # cache, so PREVALIDATE / POSTVALIDATE / RELOADALL are not needed and
+        # would cause unnecessary heavy work (and potential crashes).
+        self._log(f"Preview: setting render output to: {render_file}", LogLevel.Info)
+        self.hlev.Begin()
         try:
             shot.Set("renderFile", render_file)
             if render_settings_override:
                 shot.Set("renderSettings", render_settings_override)
             if render_compression_override:
                 shot.Set("renderCompression", render_compression_override)
-            self.hlev.AcceptShotChanges(shot, "Ramses: Configure Preview Render")
+            self.hlev.Accept("Ramses: Configure Preview Render")
         except Exception as e:
-            self.hlev.Cancel()
+            try:
+                self.hlev.Cancel()
+            except Exception:
+                pass
             self._log(f"Failed to configure preview render: {e}", LogLevel.Warning)
             return []
 
         # Snapshot directory before rendering
         before = set(os.listdir(previewFolderPath))
 
-        # Render — blocks until complete or cancelled
+        # Render via menu — same pattern as hlev.Export() / ExportAgain().
+        # hlev.RenderShot(shot) sends RENDERSHOT1 which crashes SynthEyes in
+        # undo.cpp when renderSettings is unconfigured (scene-level format not
+        # set up yet in Save Sequence).  ClickMainMenuAndWait drives the normal
+        # "Save Sequence" menu action which handles format/codec internally and
+        # does not interact with the undo stack.
+        # If the scene's Save Sequence dialog appears, the user confirms once.
+        self._log("Preview: triggering Save Sequence via menu...", LogLevel.Info)
         render_ok = False
         try:
-            self.hlev.RenderShot(shot)
+            self.hlev.ClickMainMenuAndWait("Save Sequence")
             render_ok = True
+            self._log("Preview: Save Sequence completed.", LogLevel.Info)
         except Exception as e:
             self._log(f"Preview render failed: {e}", LogLevel.Critical)
 
         # Restore original render settings regardless of render success
-        self.hlev.BeginShotChanges(shot)
         try:
+            self.hlev.Begin()
             shot.Set("renderFile", old_render_file)
             if render_settings_override:
                 shot.Set("renderSettings", old_render_settings)
             if render_compression_override:
                 shot.Set("renderCompression", old_render_compression)
-            self.hlev.AcceptShotChanges(shot, "Ramses: Restore Render Settings")
+            self.hlev.Accept("Ramses: Restore Render Settings")
         except Exception as e:
             self._log(f"Failed to restore render settings after preview: {e}", LogLevel.Warning)
-            self.hlev.Cancel()
+            try:
+                self.hlev.Cancel()
+            except Exception:
+                pass
 
         if not render_ok:
             return []
@@ -738,37 +758,59 @@ class SynthEyesHost(RamHost):
             current_yaml = ""
 
         yaml_label = (
-            "Settings (YAML):\n\n"
             "exportType         — name from SynthEyes File › Export menu\n"
             "previewFormat      — image seq: jpg png exr dpx tif  |  movie: avi mov mp4\n"
             "previewRenderSettings    — advanced: SynthEyes channel string (empty = scene default)\n"
             "previewRenderCompression — advanced: SynthEyes codec string   (empty = scene default)"
         )
 
-        # Using standard _request_input (UIManager or SyPy fallback)
-        res = self._request_input(
-            "Edit Publish Settings",
-            [
-                {
-                    "id": "YAML",
-                    "label": yaml_label,
-                    "type": "text",
-                    "default": current_yaml,
-                    "lines": 20,
-                }
-            ],
-        )
-
-        if res is not None:
+        try:
             try:
-                new_options = yaml.safe_load(res["YAML"])
-                return new_options if isinstance(new_options, dict) else {}
-            except Exception as e:
-                # On error, warn and show UI again (recursion)
-                self._log(f"Invalid YAML Settings: {e}", LogLevel.Warning)
-                return self._publishOptions(options, True)
+                from PySide2 import QtWidgets as qw, QtGui as qg
+            except ImportError:
+                from PySide6 import QtWidgets as qw, QtGui as qg
 
-        return None  # User cancelled
+            dialog = qw.QDialog()
+            dialog.setWindowTitle("Export Settings")
+            dialog.setMinimumWidth(520)
+            layout = qw.QVBoxLayout(dialog)
+
+            layout.addWidget(qw.QLabel("Settings (YAML):"))
+            layout.addWidget(qw.QLabel(yaml_label))
+
+            editor = qw.QPlainTextEdit()
+            editor.setFont(qg.QFont("Courier New", 9))
+            editor.setPlainText(current_yaml)
+            editor.setMinimumHeight(300)
+            layout.addWidget(editor)
+
+            buttons = qw.QDialogButtonBox(
+                qw.QDialogButtonBox.Ok | qw.QDialogButtonBox.Cancel
+            )
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            dialog.raise_()
+            dialog.activateWindow()
+            accepted = dialog.exec() if getattr(dialog, 'exec', None) else dialog.exec_()
+
+            if accepted:
+                try:
+                    new_options = yaml.safe_load(editor.toPlainText())
+                    if isinstance(new_options, dict):
+                        return new_options
+                    self._log("Publish settings YAML must be a mapping.", LogLevel.Warning)
+                    return self._publishOptions(options, True)
+                except Exception as e:
+                    self._log(f"Invalid YAML in publish settings: {e}", LogLevel.Warning)
+                    return self._publishOptions(options, True)
+
+            return None  # User cancelled
+
+        except Exception as e:
+            self._log(f"Could not show publish settings UI: {e}", LogLevel.Warning)
+            return options  # Fall back to defaults rather than blocking publish
 
     def _prePublish(self, publishInfo: RamFileInfo, publishOptions: dict) -> dict:
         return publishOptions

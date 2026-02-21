@@ -195,6 +195,8 @@ def run_app():
             layout.addSpacing(8)
 
             # Group 3: Publish (green — #2a422a)
+            self.btn_preview = self.create_button("Save Preview", "rampreview.png", self.on_preview, "#2a422a")
+            layout.addWidget(self.btn_preview)
             self.btn_export = self.create_button("Export to Pipeline", "rampublishsettings.png", self.on_export, "#2a422a")
             layout.addWidget(self.btn_export)
             self.btn_status = self.create_button("Update Status", "ramstatus.png", self.on_status, "#2a422a")
@@ -312,7 +314,7 @@ def run_app():
 
             # Buttons that require a pipeline context (known item + step)
             for btn in (self.btn_save, self.btn_incremental, self.btn_retrieve,
-                        self.btn_sync, self.btn_export, self.btn_status):
+                        self.btn_sync, self.btn_preview, self.btn_export, self.btn_status):
                 btn.setEnabled(in_pipeline)
 
             # Save As / Create is always available (used to enter the pipeline)
@@ -331,6 +333,15 @@ def run_app():
                 qw.QMessageBox.information(self, "Ramses", "Scene settings synced with database.")
             else:
                 qw.QMessageBox.warning(self, "Ramses", "Could not sync scene settings.\nMake sure a Ramses shot is active.")
+
+        def on_preview(self):
+            """Render and save a preview sequence (no .comp export)."""
+            try:
+                self.host.savePreview()
+            except Exception as e:
+                qw.QMessageBox.critical(self, "Preview Failed",
+                    f"Could not save preview:\n{e}")
+            self.refresh_context()
 
         def on_export(self):
             """Export tracking data via the Ramses publish lifecycle."""
