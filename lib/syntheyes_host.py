@@ -965,7 +965,7 @@ class SynthEyesHost(RamHost):
             return []
 
         options = publishOptions or {}
-        export_type = options.get("exportType", "Blackmagic Fusion Comp")
+        export_type = options.get("exportType", "Fusion Composition")
         ext = "comp" if "Fusion" in export_type else "txt"
 
         publishInfo.extension = ext
@@ -983,6 +983,7 @@ class SynthEyesHost(RamHost):
             return [export_path]
         except Exception as e:
             self._log(f"Export failed: {e}", LogLevel.Critical)
+            self._log(f"TIP: Verify the name '{export_type}' exactly matches the entry in your SynthEyes File > Export menu.", LogLevel.Info)
             return []
 
     def _publishOptions(self, proposedOptions: dict, showPublishUI: bool = False) -> dict:
@@ -990,7 +991,7 @@ class SynthEyesHost(RamHost):
         defaults = {
             # Tracking data export ─────────────────────────────────────────────
             # Name from SynthEyes File › Export menu.
-            "exportType": "Blackmagic Fusion Comp",
+            "exportType": "Fusion Composition",
 
             # Preview / Save-Sequence render ───────────────────────────────────
             # File extension that controls the output format:
