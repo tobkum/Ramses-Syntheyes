@@ -167,7 +167,7 @@ def run_app():
             )
             self.context_label.setAlignment(qc.Qt.AlignCenter)
             self.context_label.setWordWrap(True)
-            self.context_label.setMinimumHeight(70)
+            self.context_label.setMinimumHeight(90)
             layout.addWidget(self.context_label)
 
             layout.addSpacing(5)
@@ -211,7 +211,7 @@ def run_app():
             layout.addStretch()
 
             # Footer version label
-            self.btn_about = qw.QPushButton("Ramses v" + self.settings.version)
+            self.btn_about = qw.QPushButton("Ramses v" + self.host.version)
             self.btn_about.setFlat(True)
             self.btn_about.setStyleSheet("QPushButton { color: #555; font-size: 10px; background: transparent; border: none; }")
             self.btn_about.clicked.connect(self.on_about)
@@ -431,6 +431,9 @@ def run_app():
         pass  # Best-effort check; don't block startup
 
     main_win = RamsesSyntheyesApp(hlev)
+    # Keep the panel visible when SynthEyes is focused — without this the
+    # window disappears behind SynthEyes since it runs in a separate process.
+    main_win.setWindowFlags(main_win.windowFlags() | qc.Qt.WindowStaysOnTopHint)
     main_win.show()
 
     if getattr(app, 'exec', None):

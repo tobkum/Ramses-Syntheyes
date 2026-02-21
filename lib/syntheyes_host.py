@@ -75,6 +75,47 @@ class SynthEyesHost(RamHost):
         
         print(f"[{prefix}] {str(message)}")
 
+    def _markDirtyAndSave(self, filePath: str) -> None:
+        """Sets SNI filename and saves, guaranteeing the scene is written.
+
+        ``SaveIfChanged()`` is the only SyPy3 save API and only writes when
+        SynthEyes considers the scene "changed" (HasChanged() == True).
+
+        The primary fix is in ``_setupCurrentFile()``, which now uses
+        ``PostValidate + Accept`` instead of ``AcceptShotChanges`` to avoid
+        the ``RELOADALL`` that would clear the dirty flag.  This method only
+        needs the fallback for edge cases where ``_setupCurrentFile()`` was not
+        called (e.g., NewSceneAndShot creates a brand-new scene with
+        HasChanged == False and no setup block runs before save).
+
+        Fallback: commit a real shot attribute write via ``Begin()``/``Accept()``
+        (no RELOADALL) to force HasChanged = True.
+        """
+        if not self.hlev.HasChanged():
+            marked = False
+            shots = self.hlev.Shots()
+            if shots:
+                shot = shots[0]
+                try:
+                    rate = float(shot.Get("rate") or 24.0)
+                    self.hlev.Begin()
+                    shot.Set("rate", rate)           # forces a real undo entry
+                    self.hlev.Accept("Ramses: Init") # ACCEPT1 UNLOCK REDRAW, no RELOADALL
+                    marked = True
+                except Exception:
+                    try:
+                        self.hlev.Cancel()
+                    except Exception:
+                        pass
+            if not marked:
+                self._log(
+                    "Could not mark scene dirty before save (no shots). "
+                    "Scene may not be saved if SynthEyes considers it unchanged.",
+                    LogLevel.Warning,
+                )
+        self.hlev.SetSNIFileName(filePath)
+        self.hlev.SaveIfChanged()
+
     def _saveAs(
         self,
         filePath: str,
@@ -87,9 +128,9 @@ class SynthEyesHost(RamHost):
         """Internal implementation to save the .sni file."""
         if not self.hlev:
             return False
-        
+
         filePath = self.normalizePath(filePath)
-        
+
         # Ensure target directory exists
         target_dir = os.path.dirname(filePath)
         if target_dir and not os.path.exists(target_dir):
@@ -97,11 +138,10 @@ class SynthEyesHost(RamHost):
 
         old_path = self.normalizePath(self.hlev.SNIFileName() or "")
         try:
-            # Set the target path then save. SaveIfChanged() is the correct
-            # SyPy3 save method; after SetSNIFileName the scene is considered
-            # modified (filename changed), so this always writes to the new path.
-            self.hlev.SetSNIFileName(filePath)
-            self.hlev.SaveIfChanged()
+            # Set the target path then save. _markDirtyAndSave() guarantees
+            # SaveIfChanged() actually writes — brand-new scenes may have
+            # HasChanged() == False even with loaded footage.
+            self._markDirtyAndSave(filePath)
 
             # Write sidecar metadata AFTER the file exists on disk —
             # RamMetaDataManager requires the file to be present (it prunes
@@ -139,8 +179,7 @@ class SynthEyesHost(RamHost):
                 if target_dir:
                     os.makedirs(target_dir, exist_ok=True)
                 try:
-                    self.hlev.SetSNIFileName(filePath)
-                    self.hlev.SaveIfChanged()
+                    self._markDirtyAndSave(filePath)
                     # Write sidecar now that the file is on disk
                     self._store_ramses_metadata(item, step or pending_step, filePath)
                     return True
@@ -251,8 +290,14 @@ class SynthEyesHost(RamHost):
         
         shot = shots[0] # Assume primary shot
 
-        # BeginShotChanges is required (not plain Begin) when modifying shot
-        # settings so SynthEyes can correctly invalidate its RAM cache.
+        # Use BeginShotChanges (for PREVALIDATE) but close with PostValidate +
+        # Accept instead of AcceptShotChanges.  AcceptShotChanges sends
+        # "ACCEPT1 UNLOCK RELOADALL REDRAW" — the RELOADALL clears the dirty
+        # flag, which prevents SaveIfChanged() from writing the file.
+        # PostValidate + Accept sends "POSTVALIDATE1 VALIDATE1" then
+        # "ACCEPT1 UNLOCK REDRAW" (no RELOADALL), so HasChanged stays True.
+        # RELOADALL is only needed to invalidate SynthEyes's playback cache;
+        # it is not needed for the scene data to be saved correctly.
         self.hlev.BeginShotChanges(shot)
         try:
             # framerate / fps
@@ -263,7 +308,8 @@ class SynthEyesHost(RamHost):
             # project.width() returns pixels, so we do NOT set it here —
             # SynthEyes reads resolution directly from the loaded footage.
 
-            self.hlev.AcceptShotChanges(shot, "Ramses: Setup Scene")
+            self.hlev.PostValidate(shot)
+            self.hlev.Accept("Ramses: Setup Scene")  # no RELOADALL → HasChanged stays True
         except Exception as e:
             self.hlev.Cancel()
             self._log(f"Failed to setup scene: {e}", LogLevel.Warning)
@@ -560,6 +606,36 @@ class SynthEyesHost(RamHost):
         # newShot() set — they only make sense for the _openUI → _open() path.
         self._pending_new_shot_item = None
         self._pending_new_shot_step = None
+
+        if not result or not item or not step:
+            return result
+
+        # newShot() left the scene unsaved ("unnamed" in SynthEyes).
+        # Save it now to the Ramses pipeline path for this item/step.
+        # Use the existing file if one is already there (re-import), otherwise
+        # build the path from scratch using item.stepFolderPath().
+        try:
+            target_path = item.stepFilePath(step=step)
+            if not target_path:
+                step_folder = item.stepFolderPath(step)
+                if step_folder:
+                    nm = RamFileInfo()
+                    nm.project = item.projectShortName()
+                    nm.ramType = item.itemType()
+                    nm.shortName = item.shortName()
+                    nm.step = step.shortName() if hasattr(step, 'shortName') else str(step)
+                    nm.extension = "sni"
+                    target_path = os.path.join(step_folder, nm.fileName())
+
+            if target_path:
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                self._markDirtyAndSave(self.normalizePath(target_path))
+                self._store_ramses_metadata(item, step, target_path)
+            else:
+                self._log("Could not determine pipeline path — scene is unsaved.", LogLevel.Warning)
+        except Exception as e:
+            self._log(f"Failed to save imported scene to pipeline path: {e}", LogLevel.Warning)
+
         return result
 
     def _importUI(self, item: RamItem, step: RamStep) -> dict:
