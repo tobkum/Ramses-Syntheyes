@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
+import time
+import json
+import re
 try:
     import ramses.yaml as yaml
 except ImportError:
@@ -78,43 +81,44 @@ class SynthEyesHost(RamHost):
     def _markDirtyAndSave(self, filePath: str) -> None:
         """Sets SNI filename and saves, guaranteeing the scene is written.
 
-        ``SaveIfChanged()`` is the only SyPy3 save API and only writes when
-        SynthEyes considers the scene "changed" (HasChanged() == True).
-
-        The primary fix is in ``_setupCurrentFile()``, which now uses
-        ``PostValidate + Accept`` instead of ``AcceptShotChanges`` to avoid
-        the ``RELOADALL`` that would clear the dirty flag.  This method only
-        needs the fallback for edge cases where ``_setupCurrentFile()`` was not
-        called (e.g., NewSceneAndShot creates a brand-new scene with
-        HasChanged == False and no setup block runs before save).
-
-        Fallback: commit a real shot attribute write via ``Begin()``/``Accept()``
-        (no RELOADALL) to force HasChanged = True.
+        Uses the 'Save' menu command after setting the filename to ensure
+        a standard, silent save without triggering 'SaveIfChanged' dialogs.
         """
         if not self.hlev.HasChanged():
             marked = False
-            shots = self.hlev.Shots()
-            if shots:
-                shot = shots[0]
-                try:
-                    rate = float(shot.Get("rate") or 24.0)
+            try:
+                shots = self.hlev.Shots()
+                if shots:
+                    shot = shots[0]
                     self.hlev.Begin()
-                    shot.Set("rate", rate)           # forces a real undo entry
-                    self.hlev.Accept("Ramses: Init") # ACCEPT1 UNLOCK REDRAW, no RELOADALL
+                    # Force a change with a timestamp to guarantee dirty state.
+                    # Use plain Begin/Accept to avoid cache flush.
+                    shot.ramses_saved = str(time.time())
+                    self.hlev.Accept("Ramses: Force Save")
                     marked = True
+            except Exception:
+                try:
+                    self.hlev.Cancel()
                 except Exception:
-                    try:
-                        self.hlev.Cancel()
-                    except Exception:
-                        pass
+                    pass
             if not marked:
-                self._log(
-                    "Could not mark scene dirty before save (no shots). "
-                    "Scene may not be saved if SynthEyes considers it unchanged.",
-                    LogLevel.Warning,
-                )
+                self._log("Could not mark scene dirty before save (no shots).", LogLevel.Warning)
+        
         self.hlev.SetSNIFileName(filePath)
-        self.hlev.SaveIfChanged()
+        try:
+            # Trigger the standard Save menu command. 
+            # Since the filename is set, it will be silent.
+            self.hlev.ClickMainMenuAndWait("Save")
+            self._log(f"Successfully saved scene to: {filePath}", LogLevel.Info)
+        except Exception as e:
+            self._log(f"Error during save: {e}. Falling back to SaveIfChanged.", LogLevel.Warning)
+            self.hlev.SaveIfChanged()
+        
+        # Ensure the viewport remains fresh after the save
+        try:
+            self.hlev.Redraw()
+        except Exception:
+            pass
 
     def _saveAs(
         self,
@@ -246,12 +250,12 @@ class SynthEyesHost(RamHost):
 
         return settings
 
-    def setupCurrentFile(self) -> bool:
+    def setupCurrentFile(self, forceUI: bool = True) -> bool:
         """Applies Ramses settings to the current scene. Returns True on success."""
         item = self.currentItem()
         if item:
             settings = self.collectItemSettings(item)
-            return self._setupCurrentFile(item, self.currentStep(), settings)
+            return self._setupCurrentFile(item, self.currentStep(), settings, forceUI=forceUI)
         return False
 
     def save(
@@ -263,7 +267,8 @@ class SynthEyesHost(RamHost):
     ) -> bool:
         """Saves the current file, optionally setting up the scene."""
         if setupFile:
-            self.setupCurrentFile()
+            # When saving, do not force disruptive UI switches
+            self.setupCurrentFile(forceUI=False)
         else:
             item = self.currentItem()
             if item:
@@ -278,57 +283,108 @@ class SynthEyesHost(RamHost):
         state_short = state.shortName() if state else None
         return self._RamHost__save(saveFilePath, incremental, comment, state_short)
 
-    def _setupCurrentFile(self, item: RamItem, step: RamStep, setupOptions: dict) -> bool:
+    def _setupCurrentFile(self, item: RamItem, step: RamStep, setupOptions: dict, shot_obj: object = None, forceUI: bool = False) -> bool:
         """Sets the current file parameters (resolution, FPS, aspect)."""
         if not self.hlev:
             return False
         
-        # We need a shot to apply settings to
-        shots = self.hlev.Shots()
-        if not shots:
-            return True
+        # Use provided shot or fallback to the primary one
+        shot = shot_obj
+        if not shot:
+            shots = self.hlev.Shots()
+            if shots:
+                shot = shots[0]
         
-        shot = shots[0] # Assume primary shot
+        if not shot:
+            return True
 
-        # Use BeginShotChanges (for PREVALIDATE) but close with PostValidate +
-        # Accept instead of AcceptShotChanges.  AcceptShotChanges sends
-        # "ACCEPT1 UNLOCK RELOADALL REDRAW" — the RELOADALL clears the dirty
-        # flag, which prevents SaveIfChanged() from writing the file.
-        # PostValidate + Accept sends "POSTVALIDATE1 VALIDATE1" then
-        # "ACCEPT1 UNLOCK REDRAW" (no RELOADALL), so HasChanged stays True.
-        # RELOADALL is only needed to invalidate SynthEyes's playback cache;
-        # it is not needed for the scene data to be saved correctly.
-        self.hlev.BeginShotChanges(shot)
+        # Ensure we are in Z-Up mode (standard for Ramses)
         try:
-            # framerate / fps
-            if "framerate" in setupOptions:
-                shot.Set("rate", float(setupOptions["framerate"]))
+            self.hlev.SetSzlAxisMode(0)
+        except Exception:
+            pass
 
-            # NOTE: backPlateWidth is in millimetres (Sizzle doc).
-            # project.width() returns pixels, so we do NOT set it here —
-            # SynthEyes reads resolution directly from the loaded footage.
+        # 1. Shot Attributes (Heavy Refresh - Only if changed)
+        needs_heavy_refresh = False
+        target_rate = float(setupOptions.get("framerate", 24.0))
+        try:
+            # SyPy3 direct attribute access
+            if abs(float(shot.rate or 0.0) - target_rate) > 0.001:
+                needs_heavy_refresh = True
+        except Exception:
+            needs_heavy_refresh = True
 
-            self.hlev.PostValidate(shot)
-            self.hlev.Accept("Ramses: Setup Scene")  # no RELOADALL → HasChanged stays True
-        except Exception as e:
-            self.hlev.Cancel()
-            self._log(f"Failed to setup scene: {e}", LogLevel.Warning)
-            return False
+        if needs_heavy_refresh:
+            self.hlev.BeginShotChanges(shot)
+            try:
+                shot.rate = target_rate
+                self.hlev.PostValidate(shot)
+                # Use AcceptShotChanges only when media parameters changed
+                self.hlev.AcceptShotChanges(shot, "Ramses: Sync Shot Settings")
+            except Exception as e:
+                try: self.hlev.Cancel()
+                except: pass
+                self._log(f"Failed to sync shot settings: {e}", LogLevel.Warning)
+        
+        # 2. UI & Workspace ( Disrupted only if forceUI is True )
+        if forceUI:
+            try:
+                # Force UI into a state where footage is visible
+                self.hlev.SetRoom("Camera")
+                self.hlev.SetView("Camera")
+                image_flag = getattr(self.hlev, "VF_show_image", 512)
+                self.hlev.ViewFlags(set=image_flag)
+            except Exception:
+                pass
 
-        # Frame range — SetAnimStart/End are UI controls, not shot attributes,
-        # so they live outside the BeginShotChanges/AcceptShotChanges block.
+            # Camera Activation
+            try:
+                cam = shot.cam
+                if cam:
+                    self.hlev.Begin()
+                    self.hlev.SetActive(cam)
+                    self.hlev.Accept("Ramses: Activate Camera")
+            except Exception:
+                try: self.hlev.Cancel()
+                except: pass
+
+        # 3. Frame range — UI controls, not shot attributes (Safe)
         frames = int(setupOptions.get("frames", 0))
+        
+        # Smart Frame Range: If Ramses says 1 (movie), trust SynthEyes if it has more.
+        try:
+            se_frames = int(shot.frames or 0)
+            if se_frames > 1 and frames <= 1:
+                frames = se_frames
+        except Exception:
+            pass
+
         if not frames:
-            # Fallback: derive frame count from duration (seconds) × framerate
             dur = float(setupOptions.get("duration", 0))
             fps = float(setupOptions.get("framerate", 24.0))
             frames = round(dur * fps)
+        
         if frames > 0:
             start = RAM_SETTINGS.userSettings.get("compStartFrame", 1001)
             self.hlev.SetAnimStart(start)
             self.hlev.SetAnimEnd(start + frames - 1)
+            
+            # Jump to start only if we are forcing UI and currently out of range
+            if forceUI:
+                try:
+                    if abs(self.hlev.Frame() - start) > frames:
+                        self.hlev.SetFrame(start)
+                        self.hlev.Redraw()
+                except Exception:
+                    pass
 
-        # Persist identity
+        # Clear any temporary SyPy frame overrides
+        try:
+            self.hlev.ClearSzlFrame()
+        except Exception:
+            pass
+
+        # 4. Identity Persistence
         self._store_ramses_metadata(item, step)
         return True
 
@@ -337,50 +393,54 @@ class SynthEyesHost(RamHost):
         if not self.hlev:
             return False
 
-        if self.currentFilePath():
-            self.hlev.SaveIfChanged()
+        if self._isDirty():
+            doSave = self._saveChangesUI()
+            if doSave == "cancel":
+                return False
+            if doSave == "save":
+                if not self.save():
+                    return False
 
         # Get project settings
         project = item.project()
-        aspect = project.aspectRatio() if project else (16.0 / 9.0)
+        aspect = 0.0
+        if project:
+            try:
+                aspect = float(project.aspectRatio() or 0.0)
+            except Exception:
+                aspect = 0.0
 
         # Create new scene
-        # filnm can be first image of sequence or movie
-        res = self.hlev.NewSceneAndShot(self.normalizePath(footagePath), aspect)
-
-        if res:
-            # Remember which item/step this scene is for so _open() can write
-            # the sidecar once the pipeline file path is known and saved.
-            self._pending_new_shot_item = item
-            self._pending_new_shot_step = step
-            if not self._setupCurrentFile(item, step, self.collectItemSettings(item)):
-                self._log(
-                    "Scene created but settings (FPS, frame range) could not be applied.",
-                    LogLevel.Warning,
-                )
-            return True
+        self._log(f"Creating new scene with footage: {footagePath}", LogLevel.Info)
+        try:
+            res = self.hlev.NewSceneAndShot(self.normalizePath(footagePath), aspect)
+            
+            if res is not None:
+                # Remember which item/step this scene is for so _open() can write
+                # the sidecar once the pipeline file path is known and saved.
+                self._pending_new_shot_item = item
+                self._pending_new_shot_step = step
+                
+                # Sync scene settings (FPS, frame range) to the new shot
+                # We force UI updates here as it's a new scene.
+                self._setupCurrentFile(item, step, self.collectItemSettings(item), shot_obj=res, forceUI=True)
+                
+                return True
+            else:
+                self._log("NewSceneAndShot failed (returned None).", LogLevel.Critical)
+        except Exception as e:
+            self._log(f"Error calling NewSceneAndShot: {e}", LogLevel.Critical)
 
         return False
 
     def _store_ramses_metadata(
         self, item: RamItem, step: RamStep = None, filePath: str = None
     ) -> bool:
-        """Stores Ramses identity (item/step UUIDs) in the Ramses sidecar file.
+        """Stores Ramses identity (item/step UUIDs) in the Ramses sidecar file and SNI notes.
 
-        Uses RamMetaDataManager to write a JSON sidecar (_ramses_data.json) in
-        the same folder as the .sni file.  The sidecar must be written AFTER
-        the .sni file exists on disk; when called before the file is saved
-        (e.g. from _setupCurrentFile on a brand-new scene), the write is
-        deferred and this method returns True without doing anything — the write
-        will happen in _saveAs() once the file exists.
-
-        Returns True on success (or deferred write), False on I/O failure.
+        Uses RamMetaDataManager to write a JSON sidecar (_ramses_data.json) and
+        also embeds the same info in the .sni 'notes' for robust self-healing.
         """
-        path = filePath or self.currentFilePath()
-        if not path or not os.path.isfile(path):
-            # File not yet on disk — metadata will be written by _saveAs().
-            return True
-
         meta = {
             "itemUUID": str(item.uuid()),
             "projectUUID": str(item.project().uuid()) if item.project() else "",
@@ -388,17 +448,69 @@ class SynthEyesHost(RamHost):
         if step:
             meta["stepUUID"] = str(step.uuid())
 
+        # 1. SNI Internal Storage (Optimal & Self-healing)
+        try:
+            scene = self.hlev.Scene()
+            if scene:
+                self.hlev.Begin()
+                # SyPy3 allows direct property access
+                tag = f"RAMSES_ID:{json.dumps(meta)}"
+                current_notes = str(scene.notes or "")
+                if "RAMSES_ID:" in current_notes:
+                    # Update existing tag
+                    new_notes = re.sub(r"RAMSES_ID:\{.*?\}", tag, current_notes)
+                    scene.notes = new_notes
+                else:
+                    # Append new tag
+                    scene.notes = current_notes + ("\n" if current_notes else "") + tag
+                self.hlev.Accept("Ramses: Update Metadata")
+        except Exception as e:
+            try: self.hlev.Cancel()
+            except: pass
+            self._log(f"Failed to embed identity in scene notes: {e}", LogLevel.Debug)
+
+        # 2. Sidecar Storage
+        path = filePath or self.currentFilePath()
+        if not path or not os.path.isfile(path):
+            # File not yet on disk — metadata will be written by _saveAs() or _open() logic.
+            return True
+
         try:
             RamMetaDataManager.setValue(path, "ramses", meta)
             return True
         except Exception as e:
-            self._log(f"Failed to store metadata: {e}", LogLevel.Warning)
+            self._log(f"Failed to store metadata sidecar: {e}", LogLevel.Warning)
             return False
 
     def currentItem(self) -> RamItem:
-        """Gets current item, recovery via sidecar metadata if needed."""
-        item = super().currentItem()
+        """Gets current item, recovery via scene-embedded metadata or sidecar."""
+        # 1. Unnamed scene / New shot case
+        if not self.currentFilePath():
+            pending = getattr(self, "_pending_new_shot_item", None)
+            if pending:
+                return pending
 
+        # 2. Scene-embedded identity (High performance & Self-healing)
+        try:
+            scene = self.hlev.Scene()
+            notes = str(scene.notes or "")
+            match = re.search(r"RAMSES_ID:({.*?})", notes)
+            if match:
+                meta = json.loads(match.group(1))
+                item_uuid = meta.get("itemUUID")
+                if item_uuid:
+                    from ramses import RamShot, RamAsset
+                    # Try shot first (most common for tracking)
+                    real_item = RamShot(item_uuid)
+                    if real_item.shortName() == "Unknown":
+                        real_item = RamAsset(item_uuid)
+                    if real_item.shortName() != "Unknown":
+                        return real_item
+        except Exception:
+            pass
+
+        # 3. Sidecar fallback
+        item = super().currentItem()
         if not item or item.virtual():
             path = self.currentFilePath()
             if path:
@@ -407,27 +519,41 @@ class SynthEyesHost(RamHost):
                     item_uuid = meta.get("itemUUID")
                     if item_uuid:
                         from ramses import RamShot, RamAsset
-                        # Try shot first (most common for tracking)
                         real_item = RamShot(item_uuid)
                         if real_item.shortName() == "Unknown":
                             real_item = RamAsset(item_uuid)
-
                         if real_item.shortName() != "Unknown":
                             return real_item
-                        else:
-                            self._log(
-                                f"Sidecar metadata found but item UUID '{item_uuid}' "
-                                "not found in Ramses (shot or asset).",
-                                LogLevel.Warning,
-                            )
                 except Exception as e:
-                    self._log(f"Failed to recover item from sidecar metadata: {e}", LogLevel.Warning)
+                    self._log(f"Failed to recover item from metadata: {e}", LogLevel.Warning)
         return item
 
     def currentStep(self) -> RamStep:
-        """Gets current step, recovery via sidecar metadata if needed."""
-        step = super().currentStep()
+        """Gets current step, recovery via scene-embedded metadata or sidecar."""
+        # 1. Unnamed scene / New shot case
+        if not self.currentFilePath():
+            pending = getattr(self, "_pending_new_shot_step", None)
+            if pending:
+                return pending
 
+        # 2. Scene-embedded identity (High performance & Self-healing)
+        try:
+            scene = self.hlev.Scene()
+            notes = str(scene.notes or "")
+            match = re.search(r"RAMSES_ID:({.*?})", notes)
+            if match:
+                meta = json.loads(match.group(1))
+                step_uuid = meta.get("stepUUID")
+                if step_uuid:
+                    from ramses import RamStep
+                    real_step = RamStep(step_uuid)
+                    if real_step.shortName() != "Unknown":
+                        return real_step
+        except Exception:
+            pass
+
+        # 3. Sidecar fallback
+        step = super().currentStep()
         if not step or step.shortName() == "Unknown":
             path = self.currentFilePath()
             if path:
@@ -435,12 +561,36 @@ class SynthEyesHost(RamHost):
                     meta = RamMetaDataManager.getValue(path, "ramses") or {}
                     step_uuid = meta.get("stepUUID")
                     if step_uuid:
+                        from ramses import RamStep
                         real_step = RamStep(step_uuid)
                         if real_step.shortName() != "Unknown":
                             return real_step
                 except Exception:
                     pass
         return step
+
+    def saveFilePath(self) -> str:
+        """Gets the path where the current file should be saved, handling pending identity."""
+        path = super().saveFilePath()
+        if not path:
+            # Check if we have a pending identity for this unnamed scene
+            item = getattr(self, "_pending_new_shot_item", None)
+            step = getattr(self, "_pending_new_shot_step", None)
+            if item and step:
+                # Compute what the pipeline path WOULD be
+                path = item.stepFilePath(step=step)
+                if not path:
+                    # Fallback: compute path from scratch if no file exists yet
+                    step_folder = item.stepFolderPath(step)
+                    if step_folder:
+                        nm = RamFileInfo()
+                        nm.project = item.projectShortName()
+                        nm.ramType = item.itemType()
+                        nm.shortName = item.shortName()
+                        nm.step = step.shortName() if hasattr(step, "shortName") else str(step)
+                        nm.extension = "sni"
+                        path = os.path.join(step_folder, nm.fileName())
+        return self.normalizePath(path) if path else ""
 
     def _openUI(self, item: RamItem = None, step: RamStep = None) -> dict:
         """Shows the Ramses Open Dialog for opening or creating a scene."""
@@ -592,51 +742,91 @@ class SynthEyesHost(RamHost):
     # --- Mandatory Ramses API Overrides ---
 
     def _import(self, filePaths: list, item: RamItem, step: RamStep, importOptions: list, forceShowImportUI: bool) -> bool:
-        """Loads published footage into SynthEyes as a new scene/shot.
-
-        For image sequences, filePaths contains all frame files — we pass the
-        first frame and SynthEyes auto-detects the full sequence.
-        For movie clips, filePaths contains the single movie file.
-        """
+        """Loads published footage into the current SynthEyes scene as a new shot."""
         if not self.hlev or not filePaths:
             return False
-        footage_path = self.normalizePath(filePaths[0])
-        result = self.newShot(footage_path, item, step)
-        # importItem() does not call _open(), so clear the pending flags that
-        # newShot() set — they only make sense for the _openUI → _open() path.
-        self._pending_new_shot_item = None
-        self._pending_new_shot_step = None
+        
+        raw_path = str(filePaths[0])
+        if not os.path.exists(raw_path):
+            self._log(f"Footage not found: {raw_path}", LogLevel.Critical)
+            return False
 
-        if not result or not item or not step:
-            return result
+        footage_path = self.normalizePath(raw_path)
+        self._log(f"Importing footage: {footage_path}", LogLevel.Info)
+        
+        # Get project settings for aspect ratio
+        project = item.project()
+        aspect = 0.0
+        if project:
+            try:
+                aspect = float(project.aspectRatio() or 0.0)
+            except Exception:
+                aspect = 0.0
 
-        # newShot() left the scene unsaved ("unnamed" in SynthEyes).
-        # Save it now to the Ramses pipeline path for this item/step.
-        # Use the existing file if one is already there (re-import), otherwise
-        # build the path from scratch using item.stepFolderPath().
+        # 1. Fallback for empty scenes
+        # If there are no shots, or only one shot with zero frames (default),
+        # we MUST use NewSceneAndShot (via newShot) to initialize.
+        is_empty = True
         try:
-            target_path = item.stepFilePath(step=step)
-            if not target_path:
-                step_folder = item.stepFolderPath(step)
-                if step_folder:
-                    nm = RamFileInfo()
-                    nm.project = item.projectShortName()
-                    nm.ramType = item.itemType()
-                    nm.shortName = item.shortName()
-                    nm.step = step.shortName() if hasattr(step, 'shortName') else str(step)
-                    nm.extension = "sni"
-                    target_path = os.path.join(step_folder, nm.fileName())
+            num_shots = self.hlev.NumByType("SHOT")
+            if num_shots > 0:
+                shots = self.hlev.Shots()
+                if shots:
+                    # If more than one shot, it's not empty.
+                    # If one shot, check if it actually has footage.
+                    if num_shots > 1 or int(shots[0].Get("frames") or 0) > 0:
+                        is_empty = False
+        except Exception:
+            pass
 
-            if target_path:
-                os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                self._markDirtyAndSave(self.normalizePath(target_path))
-                self._store_ramses_metadata(item, step, target_path)
+        if is_empty:
+            self._log("Scene is empty, using newShot initializer.", LogLevel.Info)
+            return self.newShot(footage_path, item, step)
+
+        # 2. Add to existing scene
+        # Use AddShot to bring footage into the CURRENT scene without wiping it.
+        try:
+            self._log(f"Calling AddShot with aspect: {aspect}", LogLevel.Info)
+            res = self.hlev.AddShot(footage_path, aspect)
+            
+            if res is not None:
+                self._log(f"AddShot successful: {res.Name() if hasattr(res, 'Name') else 'New Shot'}", LogLevel.Info)
+                # If we are in an unnamed/new scene, track this as the pending identity
+                # so the UI updates and the next save knows where to go.
+                if not self.currentFilePath():
+                    self._pending_new_shot_item = item
+                    self._pending_new_shot_step = step
+
+                # Sync scene settings (FPS, frame range) to the imported footage
+                # Pass the new shot object (res) so settings are applied to IT.
+                # We force UI updates here to ensure the new media is visible.
+                self._setupCurrentFile(item, step, self.collectItemSettings(item), shot_obj=res, forceUI=True)
+                
+                # Verify frame count for diagnostic logging
+                try:
+                    num_frames = int(res.Get("frames") or 0)
+                    self._log(f"Import successful. Shot has {num_frames} frames.", LogLevel.Info)
+                except Exception:
+                    pass
+
+                # Explicitly refresh the SynthEyes UI to show the new shot
+                try:
+                    self.hlev.ReloadAll()
+                    self.hlev.Redraw()
+                except Exception:
+                    pass
+
+                # Request UI refresh in the app
+                if hasattr(self, "app") and self.app:
+                    self.app.refresh_context()
+                    
+                return True
             else:
-                self._log("Could not determine pipeline path — scene is unsaved.", LogLevel.Warning)
+                self._log("AddShot failed (returned None). Check if the file format is supported.", LogLevel.Critical)
         except Exception as e:
-            self._log(f"Failed to save imported scene to pipeline path: {e}", LogLevel.Warning)
+            self._log(f"Error calling AddShot: {e}", LogLevel.Critical)
 
-        return result
+        return False
 
     def _importUI(self, item: RamItem, step: RamStep) -> dict:
         if hasattr(self, 'app') and self.app:

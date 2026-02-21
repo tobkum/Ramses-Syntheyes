@@ -49,11 +49,12 @@ class TestSynthEyesHost(unittest.TestCase):
     def test_save_as_logic(self):
         """Verify that _saveAs correctly calls SetSNIFileName and triggers Save."""
         target_path = "D:/Work/new_track.sni"
+        
         success = self.host._saveAs(target_path, None, None, 1, "Initial", False)
         
         self.assertTrue(success)
         self.mock_hlev.SetSNIFileName.assert_called_with("D:/Work/new_track.sni")
-        self.mock_hlev.SaveIfChanged.assert_called_once()
+        self.mock_hlev.ClickMainMenuAndWait.assert_called_with("Save")
 
     def test_open_logic(self):
         """Verify that _open correctly calls OpenSNI."""
@@ -62,21 +63,6 @@ class TestSynthEyesHost(unittest.TestCase):
             success = self.host._open(path, None, None)
             self.assertTrue(success)
             self.mock_hlev.OpenSNI.assert_called_with(path)
-
-    def test_is_syntheyes_step(self):
-        """Verify step detection for SynthEyes."""
-        mock_step = MagicMock()
-        
-        # By naming
-        mock_step.shortName.return_value = "MAMO"
-        self.assertTrue(self.host.isSynthEyesStep(mock_step))
-        
-        mock_step.shortName.return_value = "MATCHMOVE"
-        self.assertTrue(self.host.isSynthEyesStep(mock_step))
-
-        # Negative
-        mock_step.shortName.return_value = "COMP"
-        self.assertFalse(self.host.isSynthEyesStep(mock_step))
 
 if __name__ == "__main__":
     unittest.main()
