@@ -766,22 +766,35 @@ class SynthEyesHost(RamHost):
         # Acquire global listener lock for atomic import & setup (API Perfection)
         self.hlev.Lock()
         try:
-            # 1. Fallback for empty scenes
+            # 1. Determine if we should initialize a new scene or add to the current one
             is_empty = True
-            try:
-                num_shots = self.hlev.NumByType("SHOT")
-                if num_shots > 0:
-                    shots = self.hlev.Shots()
-                    if shots:
-                        # If more than one shot, it's not empty.
-                        # If one shot, check if it actually has footage.
-                        if num_shots > 1 or int(shots[0].frames or 0) > 0:
+            
+            # RULE 1: If the scene has a name on disk, it's NOT empty.
+            if self.currentFilePath():
+                is_empty = False
+            else:
+                try:
+                    # RULE 2: If there's already media loaded, it's NOT empty.
+                    num_shots = self.hlev.NumByType("SHOT")
+                    if num_shots > 1:
+                        is_empty = False
+                    elif num_shots == 1:
+                        shots = self.hlev.Shots()
+                        if shots:
+                            # Check if the shot actually has a footage file linked
+                            media_path = shots[0].Get("filenam") or ""
+                            if media_path.strip():
+                                is_empty = False
+                    
+                    # RULE 3: If the user has started working (trackers/meshes), it's NOT empty.
+                    if is_empty:
+                        if self.hlev.NumByType("TRK") > 0 or self.hlev.NumByType("MESH") > 0:
                             is_empty = False
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
             if is_empty:
-                self._log("Scene is empty, using newShot initializer.", LogLevel.Info)
+                self._log("Fresh session detected. Initializing primary shot...", LogLevel.Info)
                 res = self.newShot(footage_path, item, step)
                 return res
 
