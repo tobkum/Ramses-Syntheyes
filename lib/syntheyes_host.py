@@ -763,68 +763,62 @@ class SynthEyesHost(RamHost):
             except Exception:
                 aspect = 0.0
 
-        # 1. Fallback for empty scenes
-        # If there are no shots, or only one shot with zero frames (default),
-        # we MUST use NewSceneAndShot (via newShot) to initialize.
-        is_empty = True
+        # Acquire global listener lock for atomic import & setup (API Perfection)
+        self.hlev.Lock()
         try:
-            num_shots = self.hlev.NumByType("SHOT")
-            if num_shots > 0:
-                shots = self.hlev.Shots()
-                if shots:
-                    # If more than one shot, it's not empty.
-                    # If one shot, check if it actually has footage.
-                    if num_shots > 1 or int(shots[0].Get("frames") or 0) > 0:
-                        is_empty = False
-        except Exception:
-            pass
+            # 1. Fallback for empty scenes
+            is_empty = True
+            try:
+                num_shots = self.hlev.NumByType("SHOT")
+                if num_shots > 0:
+                    shots = self.hlev.Shots()
+                    if shots:
+                        # If more than one shot, it's not empty.
+                        # If one shot, check if it actually has footage.
+                        if num_shots > 1 or int(shots[0].frames or 0) > 0:
+                            is_empty = False
+            except Exception:
+                pass
 
-        if is_empty:
-            self._log("Scene is empty, using newShot initializer.", LogLevel.Info)
-            return self.newShot(footage_path, item, step)
+            if is_empty:
+                self._log("Scene is empty, using newShot initializer.", LogLevel.Info)
+                res = self.newShot(footage_path, item, step)
+                return res
 
-        # 2. Add to existing scene
-        # Use AddShot to bring footage into the CURRENT scene without wiping it.
-        try:
-            self._log(f"Calling AddShot with aspect: {aspect}", LogLevel.Info)
-            res = self.hlev.AddShot(footage_path, aspect)
-            
-            if res is not None:
-                self._log(f"AddShot successful: {res.Name() if hasattr(res, 'Name') else 'New Shot'}", LogLevel.Info)
-                # If we are in an unnamed/new scene, track this as the pending identity
-                # so the UI updates and the next save knows where to go.
-                if not self.currentFilePath():
-                    self._pending_new_shot_item = item
-                    self._pending_new_shot_step = step
-
-                # Sync scene settings (FPS, frame range) to the imported footage
-                # Pass the new shot object (res) so settings are applied to IT.
-                # We force UI updates here to ensure the new media is visible.
-                self._setupCurrentFile(item, step, self.collectItemSettings(item), shot_obj=res, forceUI=True)
+            # 2. Add to existing scene
+            try:
+                self._log(f"Calling AddShot with aspect: {aspect}", LogLevel.Info)
+                res = self.hlev.AddShot(footage_path, aspect)
                 
-                # Verify frame count for diagnostic logging
-                try:
-                    num_frames = int(res.Get("frames") or 0)
-                    self._log(f"Import successful. Shot has {num_frames} frames.", LogLevel.Info)
-                except Exception:
-                    pass
+                if res is not None:
+                    self._log(f"AddShot successful: {res.Name() if hasattr(res, 'Name') else 'New Shot'}", LogLevel.Info)
+                    # If we are in an unnamed/new scene, track this as the pending identity
+                    if not self.currentFilePath():
+                        self._pending_new_shot_item = item
+                        self._pending_new_shot_step = step
 
-                # Explicitly refresh the SynthEyes UI to show the new shot
-                try:
+                    # Sync settings and refresh UI
+                    self._setupCurrentFile(item, step, self.collectItemSettings(item), shot_obj=res, forceUI=True)
+                    
+                    try:
+                        num_frames = int(res.frames or 0)
+                        self._log(f"Import successful. Shot has {num_frames} frames.", LogLevel.Info)
+                    except Exception:
+                        pass
+
                     self.hlev.ReloadAll()
                     self.hlev.Redraw()
-                except Exception:
-                    pass
 
-                # Request UI refresh in the app
-                if hasattr(self, "app") and self.app:
-                    self.app.refresh_context()
-                    
-                return True
-            else:
-                self._log("AddShot failed (returned None). Check if the file format is supported.", LogLevel.Critical)
-        except Exception as e:
-            self._log(f"Error calling AddShot: {e}", LogLevel.Critical)
+                    if hasattr(self, "app") and self.app:
+                        self.app.refresh_context()
+                        
+                    return True
+                else:
+                    self._log("AddShot failed (returned None).", LogLevel.Critical)
+            except Exception as e:
+                self._log(f"Error calling AddShot: {e}", LogLevel.Critical)
+        finally:
+            self.hlev.Unlock()
 
         return False
 
