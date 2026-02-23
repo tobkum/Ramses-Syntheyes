@@ -172,13 +172,14 @@ class SynthEyesHost(RamHost):
             # File doesn't exist yet — this happens when _openUI returned a new
             # scene created via newShot() without a filePath key, causing the
             # base class to compute the pipeline path and call us with it.
-            # Always consume the pending flags here — they are only valid for
-            # the single _open() call that immediately follows newShot().
+            # Only consume the pending flags when the item UUID matches — clearing
+            # them unconditionally before the check would lose identity data if
+            # _open() is unexpectedly called with a different item.
             pending = getattr(self, "_pending_new_shot_item", None)
             pending_step = getattr(self, "_pending_new_shot_step", None)
-            self._pending_new_shot_item = None
-            self._pending_new_shot_step = None
             if pending and item and pending.uuid() == item.uuid():
+                self._pending_new_shot_item = None
+                self._pending_new_shot_step = None
                 target_dir = os.path.dirname(filePath)
                 if target_dir:
                     os.makedirs(target_dir, exist_ok=True)
@@ -192,6 +193,10 @@ class SynthEyesHost(RamHost):
             return False
         try:
             self.hlev.OpenSNI(filePath)
+            # Clear any stale pending identity from a previous newShot() call —
+            # the newly opened file supplies its own identity via sidecar/notes.
+            self._pending_new_shot_item = None
+            self._pending_new_shot_step = None
             return True
         except Exception as e:
             self._log(f"Failed to open scene: {e}", LogLevel.Critical)
@@ -244,7 +249,7 @@ class SynthEyesHost(RamHost):
                     settings["framerate"] = float(seq_fps)
                     # Recompute frames using the sequence-overridden FPS so the
                     # frame count is consistent with the effective framerate.
-                    settings["frames"] = round(settings["duration"] * float(seq_fps))
+                    settings["frames"] = int(round(settings["duration"] * float(seq_fps)))
                 if seq_par:
                     settings["pixelAspectRatio"] = float(seq_par)
 
@@ -323,7 +328,7 @@ class SynthEyesHost(RamHost):
                 self.hlev.AcceptShotChanges(shot, "Ramses: Sync Shot Settings")
             except Exception as e:
                 try: self.hlev.Cancel()
-                except: pass
+                except Exception: pass
                 self._log(f"Failed to sync shot settings: {e}", LogLevel.Warning)
         
         # 2. UI & Workspace ( Disrupted only if forceUI is True )
@@ -344,9 +349,10 @@ class SynthEyesHost(RamHost):
                     self.hlev.Begin()
                     self.hlev.SetActive(cam)
                     self.hlev.Accept("Ramses: Activate Camera")
-            except Exception:
+            except Exception as e:
                 try: self.hlev.Cancel()
-                except: pass
+                except Exception: pass
+                self._log(f"Camera activation skipped: {e}", LogLevel.Debug)
 
         # 3. Frame range — UI controls, not shot attributes (Safe)
         frames = int(setupOptions.get("frames", 0))
@@ -362,10 +368,10 @@ class SynthEyesHost(RamHost):
         if not frames:
             dur = float(setupOptions.get("duration", 0))
             fps = float(setupOptions.get("framerate", 24.0))
-            frames = round(dur * fps)
-        
+            frames = int(round(dur * fps))
+
         if frames > 0:
-            start = RAM_SETTINGS.userSettings.get("compStartFrame", 1001)
+            start = int(RAM_SETTINGS.userSettings.get("compStartFrame", 1001))
             self.hlev.SetAnimStart(start)
             self.hlev.SetAnimEnd(start + frames - 1)
             
@@ -466,7 +472,7 @@ class SynthEyesHost(RamHost):
                 self.hlev.Accept("Ramses: Update Metadata")
         except Exception as e:
             try: self.hlev.Cancel()
-            except: pass
+            except Exception: pass
             self._log(f"Failed to embed identity in scene notes: {e}", LogLevel.Debug)
 
         # 2. Sidecar Storage
@@ -494,7 +500,7 @@ class SynthEyesHost(RamHost):
         try:
             scene = self.hlev.Scene()
             notes = str(scene.notes or "")
-            match = re.search(r"RAMSES_ID:({.*?})", notes)
+            match = re.search(r"RAMSES_ID:({.*?})", notes, re.DOTALL)
             if match:
                 meta = json.loads(match.group(1))
                 item_uuid = meta.get("itemUUID")
@@ -540,7 +546,7 @@ class SynthEyesHost(RamHost):
         try:
             scene = self.hlev.Scene()
             notes = str(scene.notes or "")
-            match = re.search(r"RAMSES_ID:({.*?})", notes)
+            match = re.search(r"RAMSES_ID:({.*?})", notes, re.DOTALL)
             if match:
                 meta = json.loads(match.group(1))
                 step_uuid = meta.get("stepUUID")

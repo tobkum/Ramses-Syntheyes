@@ -15,24 +15,56 @@ if plugin_lib_path not in sys.path:
 _LOCK_FILE = os.path.join(tempfile.gettempdir(), "ramses_syntheyes.lock")
 
 def _acquire_instance_lock() -> bool:
-    """Returns True if this is the first instance, False if one is already running."""
-    if os.path.exists(_LOCK_FILE):
+    """Returns True if this is the first instance, False if one is already running.
+
+    Uses O_CREAT | O_EXCL for an atomic create-or-fail, eliminating the
+    TOCTOU window that existed between the old existence-check and the write.
+    """
+    my_pid = str(os.getpid())
+
+    def _try_atomic_create() -> bool:
+        """Attempt a single atomic lock-file creation. Returns True on success."""
         try:
-            with open(_LOCK_FILE) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)   # signal 0: raises OSError if process is gone
-            print(f"Ramses SynthEyes plugin is already running (PID {pid}).")
+            fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, my_pid.encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
             return False
-        except PermissionError:
-            # On Windows, PermissionError means the process IS running
-            # (different user or insufficient permissions to signal it).
-            print(f"Ramses SynthEyes plugin is already running (PID {pid}).")
-            return False
-        except (OSError, ValueError):
-            pass  # ProcessLookupError (process gone) or bad pid in lock file
-    with open(_LOCK_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    return True
+
+    # First attempt: create atomically
+    if _try_atomic_create():
+        return True
+
+    # Lock file already exists — read the PID and check liveness
+    pid = None
+    try:
+        with open(_LOCK_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)  # signal 0: no-op, raises OSError if process is gone
+        print(f"Ramses SynthEyes plugin is already running (PID {pid}).")
+        return False
+    except PermissionError:
+        # On Windows, PermissionError means the process IS still running.
+        print(f"Ramses SynthEyes plugin is already running (PID {pid}).")
+        return False
+    except (OSError, ValueError):
+        pass  # ProcessLookupError (process gone) or unreadable/bad pid — stale lock
+
+    # Stale lock: remove it, then retry the atomic create once
+    try:
+        os.remove(_LOCK_FILE)
+    except OSError:
+        pass
+
+    if _try_atomic_create():
+        return True
+
+    # Another process slipped in during the narrow removal window
+    print("Ramses SynthEyes: could not acquire instance lock — another instance started simultaneously.")
+    return False
 
 def _release_instance_lock():
     try:
@@ -73,7 +105,7 @@ def run_app():
                     idx = parts.index("BorisFX")
                     app_name = parts[idx+1] # "SynthEyes 2026"
                     possible_paths.insert(0, os.path.join(r"C:\Program Files\BorisFX", app_name))
-                except: pass
+                except Exception: pass
 
             found = False
             print(f"Checking {len(possible_paths)} possible SynthEyes locations...")
