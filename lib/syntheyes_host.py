@@ -41,6 +41,18 @@ class SynthEyesHost(RamHost):
         except Exception:
             self.hostVersion = "Unknown"
 
+    @staticmethod
+    def _exec_dialog(dlg) -> int:
+        """PySide2/PySide6-compatible dialog exec.
+
+        PySide6 removed exec_(); PySide2 has both but exec_() is idiomatic.
+        getattr(dlg, 'exec', None) is always truthy (QDialog always has exec),
+        so the old pattern never fell through to exec_(). This picks exec_()
+        when available and falls back to exec() for PySide6.
+        """
+        fn = getattr(dlg, 'exec_', None) or getattr(dlg, 'exec', None)
+        return fn() if fn else 0
+
     def normalizePath(self, path: object) -> str:
         """Centralized path normalization for SynthEyes (forward slashes)."""
         if not path:
@@ -48,6 +60,29 @@ class SynthEyesHost(RamHost):
         path_str = str(path)
         abs_path = os.path.abspath(path_str)
         return abs_path.replace("\\", "/")
+
+    def _ensure_connected(self) -> bool:
+        """Verifies the SyPy listener is alive; attempts one reconnect if not.
+
+        Returns True if the connection is (or becomes) usable.  Call this at
+        the top of any action that would hard-fail on a dead connection.
+        """
+        try:
+            self.hlev.Version()
+            return True
+        except Exception:
+            pass
+        try:
+            if self.hlev.OpenExisting():
+                self._log("Reconnected to SynthEyes listener.", LogLevel.Info)
+                return True
+        except Exception:
+            pass
+        self._log(
+            "Lost connection to SynthEyes listener. Please restart the plugin.",
+            LogLevel.Critical,
+        )
+        return False
 
     def currentFilePath(self) -> str:
         """Gets the file path of the current .sni file."""
@@ -66,16 +101,23 @@ class SynthEyesHost(RamHost):
         return bool(self.hlev.HasChanged())
 
     def _log(self, message: str, level: int) -> None:
-        """Logs a message to the console."""
+        """Logs a message to the console.
+
+        Debug messages are suppressed unless RAM_SETTINGS.userSettings["debugLog"]
+        is set to True, allowing field diagnosis without a code deploy.
+        """
         if level < LogLevel.Info:
-            return
-        
+            if not RAM_SETTINGS.userSettings.get("debugLog", False):
+                return
+
         prefix = "Ramses"
         if level == LogLevel.Warning:
             prefix = "Ramses Warning"
         elif level == LogLevel.Critical:
             prefix = "Ramses Error"
-        
+        elif level < LogLevel.Info:
+            prefix = "Ramses Debug"
+
         print(f"[{prefix}] {str(message)}")
 
     def _markDirtyAndSave(self, filePath: str) -> None:
@@ -217,7 +259,9 @@ class SynthEyesHost(RamHost):
         if not item:
             return {}
 
-        project = RAMSES.project()
+        # item.project() is authoritative — RAMSES.project() is only the globally
+        # active project and would pull the wrong settings in multi-project setups.
+        project = item.project() or RAMSES.project()
         if not project:
             return {}
 
@@ -257,6 +301,8 @@ class SynthEyesHost(RamHost):
 
     def setupCurrentFile(self, forceUI: bool = True) -> bool:
         """Applies Ramses settings to the current scene. Returns True on success."""
+        if not self._ensure_connected():
+            return False
         item = self.currentItem()
         if item:
             settings = self.collectItemSettings(item)
@@ -309,13 +355,22 @@ class SynthEyesHost(RamHost):
         except Exception:
             pass
 
-        # 1. Shot Attributes (Heavy Refresh - Only if changed)
-        needs_heavy_refresh = False
+        # 1. Shot media attributes — resolution, PAR, FPS (BeginShotChanges because
+        #    these can invalidate the RAM cache / PREVALIDATE / POSTVALIDATE chain).
         target_rate = float(setupOptions.get("framerate", 24.0))
+        target_w    = int(setupOptions.get("width", 0))
+        target_h    = int(setupOptions.get("height", 0))
+        target_par  = float(setupOptions.get("pixelAspectRatio", 1.0))
+
+        needs_heavy_refresh = False
         try:
-            # SyPy3 direct attribute access
             if abs(float(shot.rate or 0.0) - target_rate) > 0.001:
                 needs_heavy_refresh = True
+            if target_w and target_h:
+                if (int(shot.width or 0) != target_w or
+                        int(shot.height or 0) != target_h or
+                        abs(float(shot.pixelAspect or 1.0) - target_par) > 0.001):
+                    needs_heavy_refresh = True
         except Exception:
             needs_heavy_refresh = True
 
@@ -323,8 +378,11 @@ class SynthEyesHost(RamHost):
             self.hlev.BeginShotChanges(shot)
             try:
                 shot.rate = target_rate
+                if target_w and target_h:
+                    shot.width      = target_w
+                    shot.height     = target_h
+                    shot.pixelAspect = target_par
                 self.hlev.PostValidate(shot)
-                # Use AcceptShotChanges only when media parameters changed
                 self.hlev.AcceptShotChanges(shot, "Ramses: Sync Shot Settings")
             except Exception as e:
                 try: self.hlev.Cancel()
@@ -488,91 +546,101 @@ class SynthEyesHost(RamHost):
             self._log(f"Failed to store metadata sidecar: {e}", LogLevel.Warning)
             return False
 
+    def _parse_scene_identity(self) -> tuple:
+        """Parses RAMSES_ID from scene notes in one pass.
+
+        Returns (RamItem_or_None, RamStep_or_None).  Both currentItem() and
+        currentStep() call this so the regex + JSON parse runs once per
+        refresh, not twice.
+        """
+        try:
+            scene = self.hlev.Scene()
+            notes = str(scene.notes or "")
+            match = re.search(r"RAMSES_ID:({.*?})", notes, re.DOTALL)
+            if not match:
+                return None, None
+            meta = json.loads(match.group(1))
+            from ramses import RamShot, RamAsset, RamStep
+            item = None
+            item_uuid = meta.get("itemUUID")
+            if item_uuid:
+                candidate = RamShot(item_uuid)
+                if candidate.shortName() == "Unknown":
+                    candidate = RamAsset(item_uuid)
+                if candidate.shortName() != "Unknown":
+                    item = candidate
+            step = None
+            step_uuid = meta.get("stepUUID")
+            if step_uuid:
+                candidate = RamStep(step_uuid)
+                if candidate.shortName() != "Unknown":
+                    step = candidate
+            return item, step
+        except Exception:
+            return None, None
+
+    def _sidecar_identity(self, path: str) -> tuple:
+        """Reads identity from the RamMetaDataManager sidecar. Returns (item, step)."""
+        try:
+            from ramses import RamShot, RamAsset, RamStep
+            meta = RamMetaDataManager.getValue(path, "ramses") or {}
+            item = None
+            item_uuid = meta.get("itemUUID")
+            if item_uuid:
+                candidate = RamShot(item_uuid)
+                if candidate.shortName() == "Unknown":
+                    candidate = RamAsset(item_uuid)
+                if candidate.shortName() != "Unknown":
+                    item = candidate
+            step = None
+            step_uuid = meta.get("stepUUID")
+            if step_uuid:
+                candidate = RamStep(step_uuid)
+                if candidate.shortName() != "Unknown":
+                    step = candidate
+            return item, step
+        except Exception as e:
+            self._log(f"Failed to recover identity from sidecar: {e}", LogLevel.Warning)
+            return None, None
+
     def currentItem(self) -> RamItem:
         """Gets current item, recovery via scene-embedded metadata or sidecar."""
-        # 1. Unnamed scene / New shot case
         if not self.currentFilePath():
             pending = getattr(self, "_pending_new_shot_item", None)
             if pending:
                 return pending
 
-        # 2. Scene-embedded identity (High performance & Self-healing)
-        try:
-            scene = self.hlev.Scene()
-            notes = str(scene.notes or "")
-            match = re.search(r"RAMSES_ID:({.*?})", notes, re.DOTALL)
-            if match:
-                meta = json.loads(match.group(1))
-                item_uuid = meta.get("itemUUID")
-                if item_uuid:
-                    from ramses import RamShot, RamAsset
-                    # Try shot first (most common for tracking)
-                    real_item = RamShot(item_uuid)
-                    if real_item.shortName() == "Unknown":
-                        real_item = RamAsset(item_uuid)
-                    if real_item.shortName() != "Unknown":
-                        return real_item
-        except Exception:
-            pass
+        item, _ = self._parse_scene_identity()
+        if item:
+            return item
 
-        # 3. Sidecar fallback
         item = super().currentItem()
         if not item or item.virtual():
             path = self.currentFilePath()
             if path:
-                try:
-                    meta = RamMetaDataManager.getValue(path, "ramses") or {}
-                    item_uuid = meta.get("itemUUID")
-                    if item_uuid:
-                        from ramses import RamShot, RamAsset
-                        real_item = RamShot(item_uuid)
-                        if real_item.shortName() == "Unknown":
-                            real_item = RamAsset(item_uuid)
-                        if real_item.shortName() != "Unknown":
-                            return real_item
-                except Exception as e:
-                    self._log(f"Failed to recover item from metadata: {e}", LogLevel.Warning)
+                item, _ = self._sidecar_identity(path)
+                if item:
+                    return item
         return item
 
     def currentStep(self) -> RamStep:
         """Gets current step, recovery via scene-embedded metadata or sidecar."""
-        # 1. Unnamed scene / New shot case
         if not self.currentFilePath():
             pending = getattr(self, "_pending_new_shot_step", None)
             if pending:
                 return pending
 
-        # 2. Scene-embedded identity (High performance & Self-healing)
-        try:
-            scene = self.hlev.Scene()
-            notes = str(scene.notes or "")
-            match = re.search(r"RAMSES_ID:({.*?})", notes, re.DOTALL)
-            if match:
-                meta = json.loads(match.group(1))
-                step_uuid = meta.get("stepUUID")
-                if step_uuid:
-                    from ramses import RamStep
-                    real_step = RamStep(step_uuid)
-                    if real_step.shortName() != "Unknown":
-                        return real_step
-        except Exception:
-            pass
+        _, step = self._parse_scene_identity()
+        if step:
+            return step
 
-        # 3. Sidecar fallback
         step = super().currentStep()
         if not step or step.shortName() == "Unknown":
             path = self.currentFilePath()
             if path:
-                try:
-                    meta = RamMetaDataManager.getValue(path, "ramses") or {}
-                    step_uuid = meta.get("stepUUID")
-                    if step_uuid:
-                        from ramses import RamStep
-                        real_step = RamStep(step_uuid)
-                        if real_step.shortName() != "Unknown":
-                            return real_step
-                except Exception:
-                    pass
+                _, step = self._sidecar_identity(path)
+                if step:
+                    return step
         return step
 
     def saveFilePath(self) -> str:
@@ -617,10 +685,7 @@ class SynthEyesHost(RamHost):
                     if mamo_step:
                         dialog.setCurrentStep(mamo_step)
 
-                if getattr(dialog, 'exec', None):
-                    res = dialog.exec()
-                else:
-                    res = dialog.exec_()
+                res = self._exec_dialog(dialog)
                     
                 if not res:
                     return None
@@ -698,10 +763,7 @@ class SynthEyesHost(RamHost):
                     if mamo_step:
                         dialog.setStep(mamo_step)
 
-                if getattr(dialog, 'exec', None):
-                    res = dialog.exec()
-                else:
-                    res = dialog.exec_()
+                res = self._exec_dialog(dialog)
                     
                 if res:
                     return {
@@ -723,10 +785,7 @@ class SynthEyesHost(RamHost):
                 dialog = RamStatusDialog(currentStatus)
                 dialog.raise_()
                 dialog.activateWindow()
-                if getattr(dialog, 'exec', None):
-                    res = dialog.exec()
-                else:
-                    res = dialog.exec_()
+                res = self._exec_dialog(dialog)
                 if res:
                     result = {
                         "state": dialog.state(),
@@ -751,6 +810,8 @@ class SynthEyesHost(RamHost):
         """Loads published footage into the current SynthEyes scene as a new shot."""
         if not self.hlev or not filePaths:
             return False
+        if not self._ensure_connected():
+            return False
         
         raw_path = str(filePaths[0])
         if not os.path.exists(raw_path):
@@ -769,74 +830,70 @@ class SynthEyesHost(RamHost):
             except Exception:
                 aspect = 0.0
 
-        # Acquire global listener lock for atomic import & setup (API Perfection)
+        # 1. Determine if the scene is empty — keep the lock as brief as possible:
+        #    only pure SyPy3 state reads, no UI, no file I/O.
         self.hlev.Lock()
         try:
-            # 1. Determine if we should initialize a new scene or add to the current one
             is_empty = True
-            
-            # RULE 1: If the scene has a name on disk, it's NOT empty.
             if self.currentFilePath():
                 is_empty = False
             else:
                 try:
-                    # RULE 2: If there's already media loaded, it's NOT empty.
                     num_shots = self.hlev.NumByType("SHOT")
                     if num_shots > 1:
                         is_empty = False
                     elif num_shots == 1:
                         shots = self.hlev.Shots()
                         if shots:
-                            # Check if the shot actually has a footage file linked
                             media_path = shots[0].Get("filenam") or ""
                             if media_path.strip():
                                 is_empty = False
-                    
-                    # RULE 3: If the user has started working (trackers/meshes), it's NOT empty.
                     if is_empty:
                         if self.hlev.NumByType("TRK") > 0 or self.hlev.NumByType("MESH") > 0:
                             is_empty = False
                 except Exception:
                     pass
+        finally:
+            self.hlev.Unlock()
 
-            if is_empty:
-                self._log("Fresh session detected. Initializing primary shot...", LogLevel.Info)
-                res = self.newShot(footage_path, item, step)
-                return res
+        # newShot() may show a "save changes?" dialog and do file I/O — must not
+        # hold the listener lock across that or SynthEyes cannot process messages.
+        if is_empty:
+            self._log("Fresh session detected. Initializing primary shot...", LogLevel.Info)
+            return self.newShot(footage_path, item, step)
 
-            # 2. Add to existing scene
-            try:
-                self._log(f"Calling AddShot with aspect: {aspect}", LogLevel.Info)
-                res = self.hlev.AddShot(footage_path, aspect)
-                
-                if res is not None:
-                    self._log(f"AddShot successful: {res.Name() if hasattr(res, 'Name') else 'New Shot'}", LogLevel.Info)
-                    # If we are in an unnamed/new scene, track this as the pending identity
-                    if not self.currentFilePath():
-                        self._pending_new_shot_item = item
-                        self._pending_new_shot_step = step
+        # 2. Add to existing scene — re-acquire lock for the SyPy3 AddShot call
+        self.hlev.Lock()
+        try:
+            self._log(f"Calling AddShot with aspect: {aspect}", LogLevel.Info)
+            res = self.hlev.AddShot(footage_path, aspect)
 
-                    # Sync settings and refresh UI
-                    self._setupCurrentFile(item, step, self.collectItemSettings(item), shot_obj=res, forceUI=True)
-                    
-                    try:
-                        num_frames = int(res.frames or 0)
-                        self._log(f"Import successful. Shot has {num_frames} frames.", LogLevel.Info)
-                    except Exception:
-                        pass
+            if res is not None:
+                self._log(f"AddShot successful: {res.Name() if hasattr(res, 'Name') else 'New Shot'}", LogLevel.Info)
+                if not self.currentFilePath():
+                    self._pending_new_shot_item = item
+                    self._pending_new_shot_step = step
 
-                    # NOTE: ReloadAll() sends RELOADALL which clears HasChanged.
-                    # Use Redraw() only so the dirty flag set by AddShot() survives.
-                    self.hlev.Redraw()
+                self._setupCurrentFile(item, step, self.collectItemSettings(item), shot_obj=res, forceUI=True)
 
-                    if hasattr(self, "app") and self.app:
-                        self.app.refresh_context()
-                        
-                    return True
-                else:
-                    self._log("AddShot failed (returned None).", LogLevel.Critical)
-            except Exception as e:
-                self._log(f"Error calling AddShot: {e}", LogLevel.Critical)
+                try:
+                    num_frames = int(res.frames or 0)
+                    self._log(f"Import successful. Shot has {num_frames} frames.", LogLevel.Info)
+                except Exception:
+                    pass
+
+                # NOTE: ReloadAll() sends RELOADALL which clears HasChanged.
+                # Use Redraw() only so the dirty flag set by AddShot() survives.
+                self.hlev.Redraw()
+
+                if hasattr(self, "app") and self.app:
+                    self.app.refresh_context()
+
+                return True
+            else:
+                self._log("AddShot failed (returned None).", LogLevel.Critical)
+        except Exception as e:
+            self._log(f"Error calling AddShot: {e}", LogLevel.Critical)
         finally:
             self.hlev.Unlock()
 
@@ -849,10 +906,7 @@ class SynthEyesHost(RamHost):
                 dialog = RamImportDialog()
                 dialog.raise_()
                 dialog.activateWindow()
-                if getattr(dialog, 'exec', None):
-                    res = dialog.exec()
-                else:
-                    res = dialog.exec_()
+                res = self._exec_dialog(dialog)
                 if res:
                     return {"filePaths": dialog.filePaths(), "item": dialog.currentItem(), "step": dialog.currentStep()}
             except ImportError:
@@ -875,6 +929,8 @@ class SynthEyesHost(RamHost):
             hlev.Shots()[0].Get("renderCompression")
         """
         if not self.hlev:
+            return []
+        if not self._ensure_connected():
             return []
 
         shots = self.hlev.Shots()
@@ -988,6 +1044,8 @@ class SynthEyesHost(RamHost):
         """Exports tracking data to the publish folder using SynthEyes Export."""
         if not self.hlev:
             return []
+        if not self._ensure_connected():
+            return []
 
         options = publishOptions or {}
         export_type = options.get("exportType", "Fusion Composition")
@@ -1002,10 +1060,17 @@ class SynthEyesHost(RamHost):
         if target_dir:
             os.makedirs(target_dir, exist_ok=True)
 
+        before_export = set(os.listdir(target_dir)) if os.path.isdir(target_dir) else set()
         try:
             self.hlev.Export(export_type, export_path)
             self._log(f"Exported {export_type} to: {export_path}", LogLevel.Info)
-            return [export_path]
+            # Some export types (e.g. per-camera) write multiple files — collect all
+            # new entries so the pipeline can register every published output.
+            after_export = set(os.listdir(target_dir)) if os.path.isdir(target_dir) else set()
+            new_files = sorted(
+                os.path.join(target_dir, f) for f in (after_export - before_export)
+            )
+            return new_files if new_files else [export_path]
         except Exception as e:
             self._log(f"Export failed: {e}", LogLevel.Critical)
             self._log(f"TIP: Verify the name '{export_type}' exactly matches the entry in your SynthEyes File > Export menu.", LogLevel.Info)
@@ -1082,7 +1147,7 @@ class SynthEyesHost(RamHost):
 
                 dialog.raise_()
                 dialog.activateWindow()
-                accepted = dialog.exec() if getattr(dialog, 'exec', None) else dialog.exec_()
+                accepted = self._exec_dialog(dialog)
 
                 if not accepted:
                     return None  # User cancelled
@@ -1118,10 +1183,7 @@ class SynthEyesHost(RamHost):
                 dialog = RamVersionDialog(versionFiles)
                 dialog.raise_()
                 dialog.activateWindow()
-                if getattr(dialog, 'exec', None):
-                    res = dialog.exec()
-                else:
-                    res = dialog.exec_()
+                res = self._exec_dialog(dialog)
                 if res:
                     return dialog.currentFilePath()
             except ImportError:

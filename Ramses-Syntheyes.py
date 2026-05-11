@@ -132,6 +132,13 @@ def run_app():
     from syntheyes_host import SynthEyesHost
 
     # --- PySide Setup ---
+    # _exec_compat: PySide2 has exec_() (idiomatic) and exec() as alias.
+    # PySide6 removed exec_(). Prefer exec_() so PySide2 stays idiomatic;
+    # fall back to exec() for PySide6.  getattr(dlg, 'exec', None) is always
+    # truthy and cannot distinguish the two — this helper does it correctly.
+    def _exec_compat(obj) -> int:
+        fn = getattr(obj, 'exec_', None) or getattr(obj, 'exec', None)
+        return fn() if fn else 0
     try:
         from PySide2 import QtWidgets as qw
         from PySide2 import QtCore as qc
@@ -436,17 +443,11 @@ def run_app():
                 dialog.setWindowFlags(dialog.windowFlags() | qc.Qt.WindowStaysOnTopHint)
                 dialog.raise_()
                 dialog.activateWindow()
-                if getattr(dialog, 'exec', None):
-                    dialog.exec()
-                else:
-                    dialog.exec_()
+                _exec_compat(dialog)
 
         def on_about(self):
             dialog = RamAboutDialog()
-            if getattr(dialog, 'exec', None):
-                dialog.exec()
-            else:
-                dialog.exec_()
+            _exec_compat(dialog)
 
     # --- SyPy connection ---
     print("Connecting to SynthEyes Listener...")
@@ -483,10 +484,7 @@ def run_app():
     main_win.setWindowFlags(main_win.windowFlags() | qc.Qt.WindowStaysOnTopHint)
     main_win.show()
 
-    if getattr(app, 'exec', None):
-        app.exec()
-    else:
-        app.exec_()
+    _exec_compat(app)
 
     _release_instance_lock()
 
