@@ -146,9 +146,18 @@ class SynthEyesHost(RamHost):
             if not marked:
                 self._log("Could not mark scene dirty before save (no shots).", LogLevel.Warning)
         
+        # Pre-validate the path before handing control to SynthEyes — an invalid
+        # directory or unwritable file can cause ClickMainMenuAndWait to block
+        # indefinitely waiting for a dialog the user must dismiss.
+        target_dir = os.path.dirname(filePath)
+        if target_dir and not os.path.isdir(target_dir):
+            raise OSError(f"Save target directory does not exist: {target_dir}")
+        if os.path.exists(filePath) and not os.access(filePath, os.W_OK):
+            raise OSError(f"Save target file is not writable: {filePath}")
+
         self.hlev.SetSNIFileName(filePath)
         try:
-            # Trigger the standard Save menu command. 
+            # Trigger the standard Save menu command.
             # Since the filename is set, it will be silent.
             self.hlev.ClickMainMenuAndWait("Save")
             self._log(f"Successfully saved scene to: {filePath}", LogLevel.Info)
@@ -317,6 +326,8 @@ class SynthEyesHost(RamHost):
         state: RamState = None,
     ) -> bool:
         """Saves the current file, optionally setting up the scene."""
+        if not self._ensure_connected():
+            return False
         if setupFile:
             # When saving, do not force disruptive UI switches
             self.setupCurrentFile(forceUI=False)
@@ -367,9 +378,11 @@ class SynthEyesHost(RamHost):
             if abs(float(shot.rate or 0.0) - target_rate) > 0.001:
                 needs_heavy_refresh = True
             if target_w and target_h:
-                if (int(shot.width or 0) != target_w or
-                        int(shot.height or 0) != target_h or
-                        abs(float(shot.pixelAspect or 1.0) - target_par) > 0.001):
+                # Use shot.Get() — direct Python attribute access for non-SyPy3-mapped
+                # names silently creates a Python-side attr with no C++ effect.
+                if (int(shot.Get("width") or 0) != target_w or
+                        int(shot.Get("height") or 0) != target_h or
+                        abs(float(shot.Get("pixelAspect") or 1.0) - target_par) > 0.001):
                     needs_heavy_refresh = True
         except Exception:
             needs_heavy_refresh = True
@@ -379,9 +392,11 @@ class SynthEyesHost(RamHost):
             try:
                 shot.rate = target_rate
                 if target_w and target_h:
-                    shot.width      = target_w
-                    shot.height     = target_h
-                    shot.pixelAspect = target_par
+                    # Use Set() for the same reason — raises on unknown keys instead
+                    # of silently no-oping via Python __setattr__.
+                    shot.Set("width",       target_w)
+                    shot.Set("height",      target_h)
+                    shot.Set("pixelAspect", target_par)
                 self.hlev.PostValidate(shot)
                 self.hlev.AcceptShotChanges(shot, "Ramses: Sync Shot Settings")
             except Exception as e:
@@ -474,10 +489,14 @@ class SynthEyesHost(RamHost):
             except Exception:
                 aspect = 0.0
 
-        # Create new scene
+        # Create new scene — lock only around the SyPy3 call, not the dialog above.
         self._log(f"Creating new scene with footage: {footagePath}", LogLevel.Info)
         try:
-            res = self.hlev.NewSceneAndShot(self.normalizePath(footagePath), aspect)
+            self.hlev.Lock()
+            try:
+                res = self.hlev.NewSceneAndShot(self.normalizePath(footagePath), aspect)
+            finally:
+                self.hlev.Unlock()
             
             if res is not None:
                 # Remember which item/step this scene is for so _open() can write
@@ -602,6 +621,47 @@ class SynthEyesHost(RamHost):
         except Exception as e:
             self._log(f"Failed to recover identity from sidecar: {e}", LogLevel.Warning)
             return None, None
+
+    def currentContext(self) -> tuple:
+        """Returns (currentItem, currentStep) with one scene-notes parse and at
+        most one sidecar read.
+
+        Use this instead of calling currentItem() + currentStep() separately
+        whenever you need both — it halves the scene-notes regex work.
+        """
+        # 1. Pending identity (unsaved new scenes)
+        if not self.currentFilePath():
+            pi = getattr(self, "_pending_new_shot_item", None)
+            ps = getattr(self, "_pending_new_shot_step", None)
+            if pi or ps:
+                return pi, ps
+
+        # 2. Scene-embedded identity — single regex + JSON parse for both
+        item, step = self._parse_scene_identity()
+        if item and step:
+            return item, step
+
+        # 3. Base-class file-path lookup (only for whichever is still missing)
+        base_item = super().currentItem() if not item else None
+        base_step = super().currentStep() if not step else None
+
+        # 4. Sidecar — one read fills any remaining gaps
+        sid_item, sid_step = None, None
+        path = self.currentFilePath()
+        needs_sidecar = (
+            (base_item is None or base_item.virtual()) or
+            (base_step is None or base_step.shortName() == "Unknown")
+        )
+        if path and needs_sidecar:
+            sid_item, sid_step = self._sidecar_identity(path)
+
+        # Resolve: notes > sidecar > base class (even virtual/unknown as last resort)
+        if not item:
+            item = (sid_item if (base_item is None or base_item.virtual()) else base_item) or base_item
+        if not step:
+            step = (sid_step if (base_step is None or base_step.shortName() == "Unknown") else base_step) or base_step
+
+        return item, step
 
     def currentItem(self) -> RamItem:
         """Gets current item, recovery via scene-embedded metadata or sidecar."""

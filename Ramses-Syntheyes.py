@@ -302,8 +302,11 @@ def run_app():
                     pending_uuid != self._context_cache["_pending_uuid"]):
                 self._context_cache["filePath"] = current_path
                 self._context_cache["_pending_uuid"] = pending_uuid
-                self._context_cache["item"] = self.host.currentItem()
-                self._context_cache["step"] = self.host.currentStep()
+                # currentContext() does one scene-notes parse for both values
+                # instead of two separate parses from currentItem() + currentStep().
+                item, step = self.host.currentContext()
+                self._context_cache["item"] = item
+                self._context_cache["step"] = step
 
             item = self._context_cache["item"]
             step = self._context_cache["step"]
