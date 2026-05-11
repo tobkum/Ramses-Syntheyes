@@ -170,9 +170,9 @@ def run_app():
             self.host.app = self  # Required: dialog methods check hasattr(self, 'app')
             self.hlev = hlev
 
-            # Cache for currentItem/currentStep — keyed by file path so we
-            # only call the daemon when the open scene actually changes.
-            self._context_cache = {"filePath": None, "item": None, "step": None}
+            # Cache for currentItem/currentStep — keyed by (filePath, pending_uuid)
+            # so we also refresh when a new shot is loaded into an unsaved scene.
+            self._context_cache = {"filePath": None, "_pending_uuid": None, "item": None, "step": None}
 
             self.setWindowTitle("Ramses - SynthEyes")
             self.setStyleSheet(
@@ -278,11 +278,23 @@ def run_app():
 
         def refresh_context(self):
             """Updates the context label and button states based on current file."""
-            # currentItem() and currentStep() may call the Ramses daemon.
-            # Cache them by file path — only re-query when the scene changes.
+            # Cache by (filePath, pending_uuid) — file path alone misses the case
+            # where a new shot is loaded into an unsaved (path == "") scene, because
+            # the path never changes even though the pending identity has.
             current_path = self.host.currentFilePath()
-            if current_path != self._context_cache["filePath"]:
+            pending_uuid = None
+            if not current_path:
+                pending = getattr(self.host, "_pending_new_shot_item", None)
+                if pending:
+                    try:
+                        pending_uuid = str(pending.uuid())
+                    except Exception:
+                        pass
+
+            if (current_path != self._context_cache["filePath"] or
+                    pending_uuid != self._context_cache["_pending_uuid"]):
                 self._context_cache["filePath"] = current_path
+                self._context_cache["_pending_uuid"] = pending_uuid
                 self._context_cache["item"] = self.host.currentItem()
                 self._context_cache["step"] = self.host.currentStep()
 
@@ -409,7 +421,10 @@ def run_app():
                 # Invalidate cached status data so the header shows the new state.
                 # DAEMON.setData() doesn't flush the getData() 2-second cache,
                 # so we clear it manually to force a fresh fetch.
-                ram.RamDaemonInterface.instance()._cache.pop('data', None)
+                try:
+                    ram.RamDaemonInterface.instance()._cache.pop('data', None)
+                except AttributeError:
+                    pass  # SDK version without this internal cache — no-op
             self.refresh_context()
 
         def on_check_update(self):

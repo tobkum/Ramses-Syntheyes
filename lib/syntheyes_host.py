@@ -91,9 +91,9 @@ class SynthEyesHost(RamHost):
                 if shots:
                     shot = shots[0]
                     self.hlev.Begin()
-                    # Force a change with a timestamp to guarantee dirty state.
-                    # Use plain Begin/Accept to avoid cache flush.
-                    shot.ramses_saved = str(time.time())
+                    # Use Set() — plain Python attribute assignment bypasses the
+                    # C++ binding and does not trigger HasChanged().
+                    shot.Set("ramses_saved", str(time.time()))
                     self.hlev.Accept("Ramses: Force Save")
                     marked = True
             except Exception:
@@ -473,7 +473,7 @@ class SynthEyesHost(RamHost):
         except Exception as e:
             try: self.hlev.Cancel()
             except Exception: pass
-            self._log(f"Failed to embed identity in scene notes: {e}", LogLevel.Debug)
+            self._log(f"Failed to embed identity in scene notes: {e}", LogLevel.Warning)
 
         # 2. Sidecar Storage
         path = filePath or self.currentFilePath()
@@ -953,21 +953,26 @@ class SynthEyesHost(RamHost):
         except Exception as e:
             self._log(f"Preview render failed: {e}", LogLevel.Critical)
 
-        # Restore original render settings regardless of render success
-        try:
-            self.hlev.Begin()
-            shot.Set("renderFile", old_render_file)
-            if render_settings_override:
-                shot.Set("renderSettings", old_render_settings)
-            if render_compression_override:
-                shot.Set("renderCompression", old_render_compression)
-            self.hlev.Accept("Ramses: Restore Render Settings")
-        except Exception as e:
-            self._log(f"Failed to restore render settings after preview: {e}", LogLevel.Warning)
+        # Restore original render settings regardless of render success.
+        # Each setting gets its own undo block so a failure on one does not
+        # roll back a successfully restored earlier setting via Cancel().
+        for _key, _val, _cond in (
+            ("renderFile",        old_render_file,        True),
+            ("renderSettings",    old_render_settings,    bool(render_settings_override)),
+            ("renderCompression", old_render_compression, bool(render_compression_override)),
+        ):
+            if not _cond:
+                continue
             try:
-                self.hlev.Cancel()
-            except Exception:
-                pass
+                self.hlev.Begin()
+                shot.Set(_key, _val)
+                self.hlev.Accept("Ramses: Restore Render Settings")
+            except Exception as e:
+                self._log(f"Failed to restore {_key} after preview: {e}", LogLevel.Warning)
+                try:
+                    self.hlev.Cancel()
+                except Exception:
+                    pass
 
         if not render_ok:
             return []
@@ -1051,43 +1056,47 @@ class SynthEyesHost(RamHost):
             except ImportError:
                 from PySide6 import QtWidgets as qw, QtGui as qg
 
-            dialog = qw.QDialog()
-            dialog.setWindowTitle("Export Settings")
-            dialog.setMinimumWidth(520)
-            layout = qw.QVBoxLayout(dialog)
+            # Loop instead of recurse — each bad YAML submission re-shows the
+            # same dialog with the user's edits preserved, without stacking calls.
+            while True:
+                dialog = qw.QDialog()
+                dialog.setWindowTitle("Export Settings")
+                dialog.setMinimumWidth(520)
+                layout = qw.QVBoxLayout(dialog)
 
-            layout.addWidget(qw.QLabel("Settings (YAML):"))
-            layout.addWidget(qw.QLabel(yaml_label))
+                layout.addWidget(qw.QLabel("Settings (YAML):"))
+                layout.addWidget(qw.QLabel(yaml_label))
 
-            editor = qw.QPlainTextEdit()
-            editor.setFont(qg.QFont("Courier New", 9))
-            editor.setPlainText(current_yaml)
-            editor.setMinimumHeight(300)
-            layout.addWidget(editor)
+                editor = qw.QPlainTextEdit()
+                editor.setFont(qg.QFont("Courier New", 9))
+                editor.setPlainText(current_yaml)
+                editor.setMinimumHeight(300)
+                layout.addWidget(editor)
 
-            buttons = qw.QDialogButtonBox(
-                qw.QDialogButtonBox.Ok | qw.QDialogButtonBox.Cancel
-            )
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            layout.addWidget(buttons)
+                buttons = qw.QDialogButtonBox(
+                    qw.QDialogButtonBox.Ok | qw.QDialogButtonBox.Cancel
+                )
+                buttons.accepted.connect(dialog.accept)
+                buttons.rejected.connect(dialog.reject)
+                layout.addWidget(buttons)
 
-            dialog.raise_()
-            dialog.activateWindow()
-            accepted = dialog.exec() if getattr(dialog, 'exec', None) else dialog.exec_()
+                dialog.raise_()
+                dialog.activateWindow()
+                accepted = dialog.exec() if getattr(dialog, 'exec', None) else dialog.exec_()
 
-            if accepted:
+                if not accepted:
+                    return None  # User cancelled
+
                 try:
                     new_options = yaml.safe_load(editor.toPlainText())
                     if isinstance(new_options, dict):
                         return new_options
                     self._log("Publish settings YAML must be a mapping.", LogLevel.Warning)
-                    return self._publishOptions(options, True)
                 except Exception as e:
                     self._log(f"Invalid YAML in publish settings: {e}", LogLevel.Warning)
-                    return self._publishOptions(options, True)
 
-            return None  # User cancelled
+                # Invalid YAML — preserve the user's text and loop back
+                current_yaml = editor.toPlainText()
 
         except Exception as e:
             self._log(f"Could not show publish settings UI: {e}", LogLevel.Warning)
@@ -1141,5 +1150,5 @@ class SynthEyesHost(RamHost):
                 return 'save'
             return 'discard'
         except Exception:
-            return 'discard'  # Fallback: allow proceeding without saving
+            return 'cancel'  # Safest fallback — never discard work silently on dialog failure
 
