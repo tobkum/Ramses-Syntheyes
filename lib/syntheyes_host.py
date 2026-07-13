@@ -95,6 +95,25 @@ class SynthEyesHost(RamHost):
             return ""
         return sorted(candidates)[0]
 
+    @staticmethod
+    def findStepByShortName(project, *short_names):
+        """Case-insensitive step lookup by short name.
+
+        The upstream ``project.step()`` compares short names exactly, so a
+        step named "MAMO" is invisible to a lookup for "MaMo". Matches any
+        of *short_names* against the project's steps, ignoring case.
+        """
+        if not project:
+            return None
+        wanted = {str(n).lower() for n in short_names}
+        try:
+            for s in project.steps():
+                if str(s.shortName()).lower() in wanted:
+                    return s
+        except Exception:
+            return None
+        return None
+
     def _find_plate_path(self, project, item) -> str:
         """Finds the first frame of the latest published plate for a shot.
 
@@ -805,7 +824,7 @@ class SynthEyesHost(RamHost):
                 # --- Pre-set Defaults ---
                 project = RAMSES.project()
                 if project:
-                    mamo_step = project.step("MaMo") or project.step("Matchmove")
+                    mamo_step = self.findStepByShortName(project, "MaMo", "Matchmove")
                     if mamo_step:
                         dialog.setCurrentStep(mamo_step)
 
@@ -870,7 +889,7 @@ class SynthEyesHost(RamHost):
                 project = RAMSES.project()
                 if project and dialog:
                     dialog.setShot()
-                    mamo_step = project.step("MaMo") or project.step("Matchmove")
+                    mamo_step = self.findStepByShortName(project, "MaMo", "Matchmove")
                     if mamo_step:
                         dialog.setStep(mamo_step)
 

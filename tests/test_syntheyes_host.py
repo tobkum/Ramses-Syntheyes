@@ -143,6 +143,16 @@ class TestPlateDiscovery(unittest.TestCase):
         with patch.object(syntheyes_host, "RAM_SETTINGS", settings):
             self.assertEqual(self.host._find_plate_path(project, item), "")
 
+    def test_find_step_by_short_name_case_insensitive(self):
+        """A step named MAMO satisfies the 'MaMo' dialog preselection."""
+        project, step = self._project_with_step("MAMO")
+        found = SynthEyesHost.findStepByShortName(project, "MaMo", "Matchmove")
+        self.assertIs(found, step)
+        self.assertIsNone(
+            SynthEyesHost.findStepByShortName(project, "Comp")
+        )
+        self.assertIsNone(SynthEyesHost.findStepByShortName(None, "MaMo"))
+
     def test_find_plate_respects_custom_setting(self):
         project, _ = self._project_with_step("FOOTAGE_RAW")
         item = self._item_with_files(["D:/pub/001/SH010.1001.exr"])
