@@ -21,6 +21,19 @@ from ramses import (
     RamState,
 )
 
+# Steps that hold ingested source plates. Same convention (and same user
+# setting, "plateStepNames") as Ramses-Fusion.
+DEFAULT_PLATE_STEP_NAMES = ("Plate", "Ingest", "Footage")
+
+# File types SynthEyes can open as footage. Published version folders also
+# contain sidecars (.ramses_complete, _ramses_data.json) which must never be
+# handed to SynthEyes as a plate.
+_FOOTAGE_EXTENSIONS = {
+    ".exr", ".dpx", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga",
+    ".cin", ".sgi", ".jp2", ".iff", ".pic", ".bmp",
+    ".mov", ".mp4", ".mxf", ".avi",
+}
+
 class SynthEyesHost(RamHost):
     """
     Ramses Host implementation for Boris FX SynthEyes.
@@ -60,6 +73,57 @@ class SynthEyesHost(RamHost):
         path_str = str(path)
         abs_path = os.path.abspath(path_str)
         return abs_path.replace("\\", "/")
+
+    @staticmethod
+    def _pick_footage_file(paths) -> str:
+        """Picks the footage file to open from a published-version listing.
+
+        ``latestPublishedVersionFilePaths()`` returns every file in the
+        version folder, including sidecars written by Ramses-Ingest
+        (.ramses_complete, _ramses_data.json) which sort first on disk.
+        Filters to footage types and returns the lowest frame (published
+        frames are zero-padded, so lexical order is frame order).
+
+        Returns:
+            str: A footage file path, or "" if the listing has none.
+        """
+        candidates = [
+            str(p) for p in (paths or [])
+            if os.path.splitext(str(p))[1].lower() in _FOOTAGE_EXTENSIONS
+        ]
+        if not candidates:
+            return ""
+        return sorted(candidates)[0]
+
+    def _find_plate_path(self, project, item) -> str:
+        """Finds the first frame of the latest published plate for a shot.
+
+        Plate steps are matched **case-insensitively** against the
+        ``plateStepNames`` user setting (default: Plate, Ingest, Footage),
+        so a step named "PLATE" or "plates" is found just as well.
+        """
+        names = {
+            str(n).lower()
+            for n in RAM_SETTINGS.userSettings.get(
+                "plateStepNames", DEFAULT_PLATE_STEP_NAMES
+            )
+        }
+        try:
+            steps = project.steps()
+        except Exception:
+            return ""
+        for p_step in steps:
+            try:
+                if str(p_step.shortName()).lower() not in names:
+                    continue
+                plate = self._pick_footage_file(
+                    item.latestPublishedVersionFilePaths(step=p_step)
+                )
+                if plate:
+                    return plate
+            except Exception:
+                continue
+        return ""
 
     def _ensure_connected(self) -> bool:
         """Verifies the SyPy listener is alive; attempts one reconnect if not.
@@ -772,21 +836,8 @@ class SynthEyesHost(RamHost):
                         qw.QMessageBox.Yes | qw.QMessageBox.No)
                     
                     if res_new == qw.QMessageBox.Yes:
-                        # Search for plate — step names are configurable via
-                        # RAM_SETTINGS.userSettings["plateStepNames"]
-                        plate_path = ""
-                        default_plate_steps = ["Plate", "Ingest", "Footage"]
-                        plate_step_names = RAM_SETTINGS.userSettings.get(
-                            "plateStepNames", default_plate_steps
-                        )
-                        for step_name in plate_step_names:
-                            p_step = project.step(step_name)
-                            if p_step:
-                                pub_files = item.latestPublishedVersionFilePaths(step=p_step)
-                                if pub_files:
-                                    plate_path = pub_files[0]
-                                    break
-                        
+                        plate_path = self._find_plate_path(project, item)
+
                         if plate_path:
                             # Use existing newShot method to initialize
                             if self.newShot(plate_path, item, step):
@@ -873,7 +924,9 @@ class SynthEyesHost(RamHost):
         if not self._ensure_connected():
             return False
         
-        raw_path = str(filePaths[0])
+        # The upstream import flow may pass every file of a published version
+        # folder (including sidecars) — pick actual footage from the list.
+        raw_path = self._pick_footage_file([str(p) for p in filePaths]) or str(filePaths[0])
         if not os.path.exists(raw_path):
             self._log(f"Footage not found: {raw_path}", LogLevel.Critical)
             return False

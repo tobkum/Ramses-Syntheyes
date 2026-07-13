@@ -72,5 +72,105 @@ class TestSynthEyesHost(unittest.TestCase):
         self.mock_hlev.OpenSNI.assert_called_with(path)
 
 
+class TestPlateDiscovery(unittest.TestCase):
+    """Plate lookup for 'New Shot from Plate' and footage imports."""
+
+    def setUp(self):
+        self.mock_hlev = MagicMock()
+        self.host = SynthEyesHost(self.mock_hlev)
+
+    # --- _pick_footage_file --------------------------------------------------
+
+    def test_pick_footage_skips_ingest_sidecars(self):
+        """.ramses_complete sorts first on disk but must never be the plate."""
+        files = [
+            "D:/pub/001/.ramses_complete",
+            "D:/pub/001/_ramses_data.json",
+            "D:/pub/001/TEST_S_SH010_PLATE.1002.exr",
+            "D:/pub/001/TEST_S_SH010_PLATE.1001.exr",
+        ]
+        self.assertEqual(
+            SynthEyesHost._pick_footage_file(files),
+            "D:/pub/001/TEST_S_SH010_PLATE.1001.exr",
+        )
+
+    def test_pick_footage_accepts_movies(self):
+        files = ["D:/pub/001/_ramses_data.json", "D:/pub/001/plate.mov"]
+        self.assertEqual(
+            SynthEyesHost._pick_footage_file(files), "D:/pub/001/plate.mov"
+        )
+
+    def test_pick_footage_empty_when_only_sidecars(self):
+        files = ["D:/pub/001/.ramses_complete", "D:/pub/001/_ramses_data.json"]
+        self.assertEqual(SynthEyesHost._pick_footage_file(files), "")
+        self.assertEqual(SynthEyesHost._pick_footage_file([]), "")
+        self.assertEqual(SynthEyesHost._pick_footage_file(None), "")
+
+    # --- _find_plate_path ----------------------------------------------------
+
+    def _project_with_step(self, short_name):
+        step = MagicMock()
+        step.shortName.return_value = short_name
+        project = MagicMock()
+        project.steps.return_value = [step]
+        return project, step
+
+    def _item_with_files(self, files):
+        item = MagicMock()
+        item.latestPublishedVersionFilePaths.return_value = files
+        return item
+
+    def test_find_plate_is_case_insensitive(self):
+        """A step named PLATE matches the default 'Plate' entry."""
+        project, step = self._project_with_step("PLATE")
+        item = self._item_with_files(
+            ["D:/pub/001/.ramses_complete", "D:/pub/001/SH010.1001.exr"]
+        )
+        import syntheyes_host
+        settings = MagicMock()
+        settings.userSettings = {}
+        with patch.object(syntheyes_host, "RAM_SETTINGS", settings):
+            result = self.host._find_plate_path(project, item)
+        self.assertEqual(result, "D:/pub/001/SH010.1001.exr")
+        item.latestPublishedVersionFilePaths.assert_called_with(step=step)
+
+    def test_find_plate_ignores_non_plate_steps(self):
+        project, _ = self._project_with_step("Comp")
+        item = self._item_with_files(["D:/pub/001/SH010.1001.exr"])
+        import syntheyes_host
+        settings = MagicMock()
+        settings.userSettings = {}
+        with patch.object(syntheyes_host, "RAM_SETTINGS", settings):
+            self.assertEqual(self.host._find_plate_path(project, item), "")
+
+    def test_find_plate_respects_custom_setting(self):
+        project, _ = self._project_with_step("FOOTAGE_RAW")
+        item = self._item_with_files(["D:/pub/001/SH010.1001.exr"])
+        import syntheyes_host
+        settings = MagicMock()
+        settings.userSettings = {"plateStepNames": ["footage_raw"]}
+        with patch.object(syntheyes_host, "RAM_SETTINGS", settings):
+            result = self.host._find_plate_path(project, item)
+        self.assertEqual(result, "D:/pub/001/SH010.1001.exr")
+
+    def test_import_prefers_footage_over_sidecars(self):
+        """_import handed a full version-folder listing loads the footage."""
+        files = [
+            "D:/pub/001/.ramses_complete",
+            "D:/pub/001/SH010.1001.exr",
+        ]
+        item = MagicMock()
+        # Empty session: no scene file, no shots/trackers/meshes
+        self.mock_hlev.SNIFileName.return_value = ""
+        self.mock_hlev.NumByType.return_value = 0
+        with patch("os.path.exists", return_value=True), \
+             patch.object(self.host, "_ensure_connected", return_value=True), \
+             patch.object(self.host, "newShot", return_value=True) as mock_new:
+            result = self.host._import(files, item, None, [], False)
+        self.assertTrue(result)
+        mock_new.assert_called_once()
+        self.assertIn("SH010.1001.exr", mock_new.call_args[0][0])
+
+
 if __name__ == "__main__":
     unittest.main()
