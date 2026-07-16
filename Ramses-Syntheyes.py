@@ -323,6 +323,10 @@ def run_app():
                 "Save As / Create...", "ramsave.png", self.on_save_as, WORKING_HUE,
                 tooltip="Save as a new item or step in the pipeline, or create a new scene.")
             layout.addWidget(self.btn_save_as)
+            self.btn_template = self.create_button(
+                "Save as Template", "ramtemplate.png", self.on_save_template, WORKING_HUE,
+                tooltip="Save the current scene as a template for this step (axis, lens and export setup).")
+            layout.addWidget(self.btn_template)
 
             layout.addSpacing(8)
 
@@ -577,8 +581,9 @@ def run_app():
             # Buttons that require a pipeline context (known item + step) AND the
             # daemon (they read/write the database).
             for btn in (self.btn_save, self.btn_incremental, self.btn_comment,
-                        self.btn_retrieve, self.btn_sync, self.btn_preview,
-                        self.btn_open_preview, self.btn_export, self.btn_status):
+                        self.btn_retrieve, self.btn_template, self.btn_sync,
+                        self.btn_preview, self.btn_open_preview, self.btn_export,
+                        self.btn_status):
                 btn.setEnabled(in_pipeline and online)
 
             # Buttons that need the daemon to browse/list, but not a current
@@ -698,6 +703,20 @@ def run_app():
             if self.host.saveAs():
                 self.refresh_context()
                 self._set_status("✓ Saved into the pipeline.", "ok")
+
+        def on_save_template(self):
+            """Save the current scene as a reusable template for this step."""
+            if not self.host.currentStep():
+                self._set_status("No step — open or create a shot first.", "warn")
+                return
+            name, ok = qw.QInputDialog.getText(
+                self, "Save as Template", "Template name:", text="NewTemplate")
+            if not ok or not name.strip():
+                return
+            if self.host.saveAsTemplate(name):
+                self._set_status(f"✓ Template '{name.strip()}' saved.", "ok")
+            else:
+                self._set_status("Could not save template — see the SynthEyes console.", "warn")
 
         def on_switch_shot(self):
             if self.host.open():

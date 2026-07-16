@@ -9,6 +9,7 @@ from ramses import (
     RamStep,
     RamStatus,
     RamFileInfo,
+    RamFileManager,
     LogLevel,
     ItemType,
     RAMSES,
@@ -847,6 +848,59 @@ class SynthEyesHost(RamHost):
                         nm.extension = "sni"
                         path = os.path.join(step_folder, nm.fileName())
         return self.normalizePath(path) if path else ""
+
+    def saveAsTemplate(self, name: str, step: RamStep = None) -> str:
+        """Saves the current scene as a template in the step's templates folder.
+
+        The scene must already be saved on disk: we flush the latest changes to
+        the working file and copy it into the templates folder, so the working
+        file keeps its own identity (mirrors Ramses-Fusion's template flow).
+
+        Returns the template path on success, or "" on failure.
+        """
+        if not self._ensure_connected():
+            return ""
+        step = step or self.currentStep()
+        if not step:
+            self._log("Cannot save template: no current step.", LogLevel.Warning)
+            return ""
+
+        clean = re.sub(r"[^A-Za-z0-9_]", "", name.replace(" ", "_").replace("-", "_"))
+        if not clean:
+            self._log("Cannot save template: the name is empty after sanitising.", LogLevel.Warning)
+            return ""
+
+        src = self.currentFilePath()
+        if not src or not os.path.isfile(src):
+            self._log("Cannot save template: save the scene first.", LogLevel.Warning)
+            return ""
+
+        tpl_folder = step.templatesFolderPath()
+        if not tpl_folder:
+            self._log("Cannot save template: the step has no templates folder.", LogLevel.Warning)
+            return ""
+
+        # For GENERAL-type files RamFileInfo.fileName() omits shortName, so the
+        # template name goes in the resource field (which IS included) to keep
+        # each template uniquely named: PROJ_G_<step>_<name>.sni
+        nm = RamFileInfo()
+        nm.project = step.projectShortName()
+        nm.ramType = ItemType.GENERAL
+        nm.step = step.shortName()
+        nm.resource = clean
+        nm.extension = "sni"
+        target = self.normalizePath(os.path.join(tpl_folder, nm.fileName()))
+
+        try:
+            # Flush the current scene, then copy it to the template path.
+            self._markDirtyAndSave(src)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            RamFileManager.copy(src, target, separateThread=False)
+            self._log(f"Template saved to: {target}", LogLevel.Info)
+            return target
+        except Exception as e:
+            self._log(f"Failed to save template: {e}", LogLevel.Critical)
+            return ""
 
     def _openUI(self, item: RamItem = None, step: RamStep = None) -> dict:
         """Shows the Ramses Open Dialog for opening or creating a scene."""
