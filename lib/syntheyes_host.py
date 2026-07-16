@@ -21,6 +21,24 @@ from ramses import (
     RamState,
 )
 
+# =============================================================================
+# APPLY RUNTIME PATCHES
+# =============================================================================
+# Fix the vendored SDK's data-loss / crash bugs at runtime (see ramses_patches).
+# This module is imported early by the entry script, so patching here installs
+# the fixes before any metadata or daemon call is made.
+try:
+    import ramses_patches
+    ramses_patches.apply()
+    from ramses_patches import DisableMakedirs
+except ImportError:
+    print(
+        "[Ramses] Warning: ramses_patches module not found. Critical fixes may be missing."
+    )
+    # Read-only probes below use `with DisableMakedirs():` - degrade to a
+    # no-op context manager rather than crashing if the patches are missing.
+    from contextlib import nullcontext as DisableMakedirs
+
 # Steps that hold ingested source plates. Same convention (and same user
 # setting, "plateStepNames") as Ramses-Fusion.
 DEFAULT_PLATE_STEP_NAMES = ("Plate", "Ingest", "Footage")
@@ -135,9 +153,13 @@ class SynthEyesHost(RamHost):
             try:
                 if str(p_step.shortName()).lower() not in names:
                     continue
-                plate = self._pick_footage_file(
-                    item.latestPublishedVersionFilePaths(step=p_step)
-                )
+                # Read-only probe: without DisableMakedirs this creates a
+                # _published folder in every plate step just to look for the
+                # latest plate (SDK path getters mkdir on read).
+                with DisableMakedirs():
+                    plate = self._pick_footage_file(
+                        item.latestPublishedVersionFilePaths(step=p_step)
+                    )
                 if plate:
                     return plate
             except Exception:

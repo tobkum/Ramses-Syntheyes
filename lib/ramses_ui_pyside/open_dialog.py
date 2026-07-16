@@ -50,6 +50,13 @@ from ramses_ui_pyside.dialog import RamDialog
 from ramses_ui_pyside.itemstep_selector import RamItemStepSelectWidget
 from ramses_ui_pyside.search_list import RamSearchListWidget
 
+try:
+    # Suppress the SDK's mkdir-on-read while browsing: listing steps/versions
+    # must never create folders on disk (see ramses_patches).
+    from ramses_patches import DisableMakedirs
+except ImportError:
+    from contextlib import nullcontext as DisableMakedirs
+
 class RamOpenDialog(RamDialog):
     """Open item Dialog"""
 
@@ -204,8 +211,14 @@ class RamOpenDialog(RamDialog):
         itemType = self.itemSelector.itemType()
 
         if itemType == ItemType.GENERAL:
-            # List files in the step folder
-            stepFolder = step.folderPath()
+            # List files in the step folder. step can be None and the folder
+            # may not exist yet - either would abort population with an
+            # exception. Read-only listing: don't let the getter mkdir.
+            with DisableMakedirs():
+                stepFolder = step.folderPath() if step else ""
+            if not stepFolder or not os.path.isdir(stepFolder):
+                self.__check()
+                return
             for f in os.listdir(stepFolder):
                 filePath = os.path.join(stepFolder, f)
 
@@ -230,7 +243,9 @@ class RamOpenDialog(RamDialog):
         if not item:
             self.__check()
             return
-        files = item.stepFilePaths(step)
+        # Read-only listing of the step's working files.
+        with DisableMakedirs():
+            files = item.stepFilePaths(step)
         for file in files:
             nm = self.__validateFile(file)
             if not nm:
@@ -270,7 +285,9 @@ class RamOpenDialog(RamDialog):
             listItem.setData(qc.Qt.UserRole, resourceItem.data(qc.Qt.UserRole))
             self.versionList.addItem(listItem)
 
-        versionFiles = item.versionFilePaths( self.currentResource(), self.currentStep() )
+        # Read-only listing of prior versions.
+        with DisableMakedirs():
+            versionFiles = item.versionFilePaths( self.currentResource(), self.currentStep() )
         versionFiles.reverse()
 
         # Add other versions
@@ -346,10 +363,13 @@ class RamOpenDialog(RamDialog):
 
         step = self.currentStep()
 
-        for ext in self.__fileTypes:
-            fp = item.stepFilePath(extension=ext, step=step)
-            if fp != "":
-                return fp
+        # Read-only probe for the item's working file path. This runs on every
+        # selection change (via currentResource/__check), so it must not mkdir.
+        with DisableMakedirs():
+            for ext in self.__fileTypes:
+                fp = item.stepFilePath(extension=ext, step=step)
+                if fp != "":
+                    return fp
 
         return ""
 
