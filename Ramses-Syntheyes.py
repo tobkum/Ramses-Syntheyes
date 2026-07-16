@@ -168,7 +168,7 @@ def run_app():
                 print("Please tell me the FULL PATH to your 'SynthEyes.exe' file.")
                 return
 
-    from syntheyes_host import SynthEyesHost
+    from syntheyes_host import SynthEyesHost, DEFAULT_PLATE_STEP_NAMES
 
     # --- PySide Setup ---
     # _exec_compat: PySide2 has exec_() (idiomatic) and exec() as alias.
@@ -334,6 +334,10 @@ def run_app():
             layout.addSpacing(8)
 
             # Group 4: Settings
+            self.btn_settings = self.create_button(
+                "Settings", "ramsettings.png", self.on_settings, NEUTRAL_HUE,
+                tooltip="Configure plate step names, start frame and debug logging.")
+            layout.addWidget(self.btn_settings)
             self.btn_update = self.create_button(
                 "Check for Update", "ramupdate.png", self.on_check_update, NEUTRAL_HUE,
                 tooltip="Check whether a newer version of the Ramses SynthEyes plugin is available.")
@@ -676,6 +680,61 @@ def run_app():
                 dialog.raise_()
                 dialog.activateWindow()
                 _exec_compat(dialog)
+
+        def on_settings(self):
+            """Edit the user-facing settings without hand-editing the JSON file."""
+            us = self.settings.userSettings
+
+            dialog = qw.QDialog(self)
+            dialog.setWindowTitle("Ramses SynthEyes — Settings")
+            dialog.setMinimumWidth(420)
+            layout = qw.QVBoxLayout(dialog)
+
+            form = qw.QFormLayout()
+            layout.addLayout(form)
+
+            plate_names = us.get("plateStepNames", list(DEFAULT_PLATE_STEP_NAMES))
+            plate_edit = qw.QLineEdit(", ".join(str(n) for n in plate_names))
+            plate_edit.setToolTip(
+                "Step short names searched (in order) for the source plate when "
+                "creating a new scene. Comma-separated; case-insensitive.")
+            form.addRow("Plate step names:", plate_edit)
+
+            start_spin = qw.QSpinBox()
+            start_spin.setRange(0, 1000000)
+            start_spin.setValue(int(us.get("compStartFrame", 1001)))
+            start_spin.setToolTip("First frame number applied to the scene's frame range.")
+            form.addRow("Start frame:", start_spin)
+
+            debug_check = qw.QCheckBox("Verbose debug logging to the console")
+            debug_check.setChecked(bool(us.get("debugLog", False)))
+            form.addRow("Diagnostics:", debug_check)
+
+            buttons = qw.QDialogButtonBox(
+                qw.QDialogButtonBox.Save | qw.QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            dialog.setWindowFlags(dialog.windowFlags() | qc.Qt.WindowStaysOnTopHint)
+            dialog.raise_()
+            dialog.activateWindow()
+            if not _exec_compat(dialog):
+                return
+
+            # Persist. Keep an existing plate list rather than wiping it if the
+            # field was cleared to empty — an empty list disables plate lookup.
+            names = [n.strip() for n in plate_edit.text().split(",") if n.strip()]
+            if names:
+                us["plateStepNames"] = names
+            us["compStartFrame"] = int(start_spin.value())
+            us["debugLog"] = bool(debug_check.isChecked())
+            try:
+                self.settings.save()
+                self._set_status("✓ Settings saved.", "ok")
+            except Exception as e:
+                self.host._log(f"Failed to save settings: {e}", ram.LogLevel.Critical)
+                self._set_status("Could not save settings — see the console.", "error")
 
         def on_about(self):
             dialog = RamAboutDialog()
