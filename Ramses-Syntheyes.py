@@ -199,6 +199,7 @@ def run_app():
     from ramses_ui_pyside.about_dialog import RamAboutDialog
     from ramses_ui_pyside.import_dialog import RamImportDialog
     from ramses_ui_pyside.update_dialog import RamUpdateDialog
+    from ramses_ui_pyside.comment_dialog import RamCommentDialog
 
     class RamsesSyntheyesApp(qw.QMainWindow):
         """The main application window for the Ramses SynthEyes integration."""
@@ -296,6 +297,10 @@ def run_app():
                 "Save New Version", "ramsaveincremental.png", self.on_incremental, WORKING_HUE,
                 tooltip="Archive a new numbered version into _versions (e.g. v001 -> v002).")
             layout.addWidget(self.btn_incremental)
+            self.btn_comment = self.create_button(
+                "Save with Note", "ramcomment.png", self.on_comment, WORKING_HUE,
+                tooltip="Save the scene and attach a descriptive note to the version in the Ramses database.")
+            layout.addWidget(self.btn_comment)
             self.btn_retrieve = self.create_button(
                 "Version History / Restore", "ramretrieve.png", self.on_retrieve, WORKING_HUE,
                 tooltip="Browse and restore a previous version of this scene.")
@@ -526,9 +531,9 @@ def run_app():
                     self.context_label.setText("<font color='#cc9900'>No Active Scene</font>")
 
             # Buttons that require a pipeline context (known item + step)
-            for btn in (self.btn_save, self.btn_incremental, self.btn_retrieve,
-                        self.btn_sync, self.btn_preview, self.btn_open_preview,
-                        self.btn_export, self.btn_status):
+            for btn in (self.btn_save, self.btn_incremental, self.btn_comment,
+                        self.btn_retrieve, self.btn_sync, self.btn_preview,
+                        self.btn_open_preview, self.btn_export, self.btn_status):
                 btn.setEnabled(in_pipeline)
 
             # Save As / Create is always available (used to enter the pipeline)
@@ -603,6 +608,36 @@ def run_app():
             else:
                 self._set_status("Save failed — see the SynthEyes console.", "error")
             self.refresh_context()
+
+        def on_comment(self):
+            """Save the scene and attach a note to the current version."""
+            host = self.host
+            status = host.currentStatus()
+            current_note = status.comment() if status else ""
+            state = status.state() if status else None
+            current_version = host.currentVersion()
+
+            dialog = RamCommentDialog(current_version, current_note)
+            dialog.setWindowFlags(dialog.windowFlags() | qc.Qt.WindowStaysOnTopHint)
+            dialog.raise_()
+            dialog.activateWindow()
+            if not _exec_compat(dialog):
+                return
+
+            new_note = dialog.comment()
+            if new_note == current_note:
+                self._set_status("Note unchanged — nothing saved.", "info")
+                return
+
+            # Non-incremental save-over that records the note against the current
+            # version, tagged with the existing state (mirrors Ramses-Fusion).
+            if host.save(comment=new_note, state=state):
+                if status:
+                    status.setComment(new_note)
+                self.refresh_context()
+                self._set_status(f"✓ Saved with note · {time.strftime('%H:%M')}", "ok")
+            else:
+                self._set_status("Save failed — see the SynthEyes console.", "error")
 
         def on_retrieve(self):
             if self.host.restoreVersion():
