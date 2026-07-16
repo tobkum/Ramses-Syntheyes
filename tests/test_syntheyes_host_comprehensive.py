@@ -579,5 +579,113 @@ class TestSaveChangesUI(unittest.TestCase):
         self.assertEqual(result, "cancel")
 
 
+# ---------------------------------------------------------------------------
+# resolvePreviewPath: newest preview file, read-only
+# ---------------------------------------------------------------------------
+
+class TestResolvePreviewPath(unittest.TestCase):
+
+    def setUp(self):
+        self.host, _ = _make_host()
+
+    def test_empty_when_no_folder(self):
+        with patch.object(self.host, "previewPath", return_value=""):
+            self.assertEqual(self.host.resolvePreviewPath(), "")
+
+    def test_empty_when_folder_missing(self):
+        with patch.object(self.host, "previewPath",
+                          return_value="/no/such/preview/folder"):
+            self.assertEqual(self.host.resolvePreviewPath(), "")
+
+    def test_returns_newest_media_file(self):
+        import tempfile
+        folder = tempfile.mkdtemp()
+        old = os.path.join(folder, "shot_preview.0001.jpg")
+        new = os.path.join(folder, "shot_preview.0002.jpg")
+        # A non-media sidecar that must be ignored even though it may be newest.
+        sidecar = os.path.join(folder, "_ramses_data.json")
+        for p in (old, new, sidecar):
+            with open(p, "w") as f:
+                f.write("x")
+        # Force deterministic mtimes: old < new, sidecar newest of all.
+        os.utime(old, (1000, 1000))
+        os.utime(new, (2000, 2000))
+        os.utime(sidecar, (3000, 3000))
+        with patch.object(self.host, "previewPath", return_value=folder):
+            result = self.host.resolvePreviewPath()
+        # Newest *media* file wins; the newer sidecar is filtered out.
+        self.assertEqual(os.path.normpath(result), os.path.normpath(new))
+
+    def test_empty_when_only_sidecars(self):
+        import tempfile
+        folder = tempfile.mkdtemp()
+        with open(os.path.join(folder, "_ramses_data.json"), "w") as f:
+            f.write("{}")
+        with patch.object(self.host, "previewPath", return_value=folder):
+            self.assertEqual(self.host.resolvePreviewPath(), "")
+
+
+# ---------------------------------------------------------------------------
+# saveAsTemplate: copies the saved scene into the step's templates folder
+# ---------------------------------------------------------------------------
+
+class TestSaveAsTemplate(unittest.TestCase):
+
+    def setUp(self):
+        self.host, self.hlev = _make_host()
+        self.hlev.Version.return_value = "2026"  # _ensure_connected passes
+
+    def _make_step(self, tpl_folder):
+        step = MagicMock()
+        step.templatesFolderPath.return_value = tpl_folder
+        step.projectShortName.return_value = "PROJ"
+        step.shortName.return_value = "MaMo"
+        return step
+
+    def test_empty_when_no_step(self):
+        with patch.object(self.host, "currentStep", return_value=None):
+            self.assertEqual(self.host.saveAsTemplate("Hero"), "")
+
+    def test_empty_when_name_sanitises_to_empty(self):
+        step = self._make_step("/tmp/x")
+        self.assertEqual(self.host.saveAsTemplate("!!!", step=step), "")
+
+    def test_empty_when_scene_not_saved(self):
+        step = self._make_step("/tmp/x")
+        with patch.object(self.host, "currentFilePath", return_value=""):
+            self.assertEqual(self.host.saveAsTemplate("Hero", step=step), "")
+
+    def test_copies_scene_to_templates_folder(self):
+        import tempfile
+        work_dir = tempfile.mkdtemp()
+        tpl_dir = tempfile.mkdtemp()
+        src = os.path.join(work_dir, "PROJ_G_MaMo.sni")
+        with open(src, "w") as f:
+            f.write("scene-data")
+        step = self._make_step(tpl_dir)
+        with patch.object(self.host, "currentFilePath", return_value=src), \
+             patch.object(self.host, "_markDirtyAndSave") as mock_save:
+            result = self.host.saveAsTemplate("Hero Setup", step=step)
+        # Correct folder, real copy performed, scene flushed first.
+        self.assertTrue(result)
+        self.assertEqual(os.path.dirname(os.path.normpath(result)),
+                         os.path.normpath(tpl_dir))
+        self.assertTrue(os.path.isfile(result))
+        mock_save.assert_called_once_with(src)
+
+    def test_distinct_names_produce_distinct_files(self):
+        """The template name must land in the filename (GENERAL omits shortName)."""
+        import tempfile
+        src = os.path.join(tempfile.mkdtemp(), "PROJ_G_MaMo.sni")
+        with open(src, "w") as f:
+            f.write("scene-data")
+        step = self._make_step(tempfile.mkdtemp())
+        with patch.object(self.host, "currentFilePath", return_value=src), \
+             patch.object(self.host, "_markDirtyAndSave"):
+            a = self.host.saveAsTemplate("Alpha", step=step)
+            b = self.host.saveAsTemplate("Beta", step=step)
+        self.assertNotEqual(os.path.basename(a), os.path.basename(b))
+
+
 if __name__ == "__main__":
     unittest.main()

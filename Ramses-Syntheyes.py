@@ -72,9 +72,48 @@ def _release_instance_lock():
     except OSError:
         pass
 
+def _quarantine_corrupt_addon_settings():
+    """Moves a corrupt add-on settings file aside so startup can't hard-crash.
+
+    RamSettings loads ${APPDATA}/Ramses/Config/ramses_addons_settings.json on
+    the first `import ramses`; a truncated or malformed JSON there would raise
+    deep in the SDK before the UI ever appears. Rename it to *.corrupt and let
+    the SDK fall back to defaults. Only the platforms the SDK itself handles
+    (Windows, Linux) are covered — it doesn't define a Darwin config path.
+    """
+    import platform as _platform
+    system = _platform.system()
+    if system == "Windows":
+        folder = os.path.expandvars("${APPDATA}/Ramses/Config")
+    elif system == "Linux":
+        folder = os.path.expanduser("~/.config/Ramses/Config")
+    else:
+        return
+    settings_file = os.path.join(folder, "ramses_addons_settings.json")
+    if not os.path.isfile(settings_file):
+        return
+    try:
+        with open(settings_file, "r", encoding="utf8") as f:
+            json.load(f)
+    except (ValueError, OSError):
+        quarantined = settings_file + ".corrupt"
+        try:
+            os.replace(settings_file, quarantined)
+            print(
+                "[Ramses] Warning: the add-on settings file was corrupt and "
+                "has been moved to " + quarantined + ". Default settings "
+                "will be used; re-configure the add-on if needed."
+            )
+        except OSError:
+            pass
+
 def run_app():
     if not _acquire_instance_lock():
         return
+
+    # Move a corrupt settings file aside before the first `import ramses`
+    # (below, via syntheyes_host) triggers RamSettings to read it.
+    _quarantine_corrupt_addon_settings()
 
     # --- SyPy Setup ---
     print("Searching for SyPy3...")
@@ -129,7 +168,7 @@ def run_app():
                 print("Please tell me the FULL PATH to your 'SynthEyes.exe' file.")
                 return
 
-    from syntheyes_host import SynthEyesHost
+    from syntheyes_host import SynthEyesHost, DEFAULT_PLATE_STEP_NAMES
 
     # --- PySide Setup ---
     # _exec_compat: PySide2 has exec_() (idiomatic) and exec() as alias.
@@ -160,6 +199,7 @@ def run_app():
     from ramses_ui_pyside.about_dialog import RamAboutDialog
     from ramses_ui_pyside.import_dialog import RamImportDialog
     from ramses_ui_pyside.update_dialog import RamUpdateDialog
+    from ramses_ui_pyside.comment_dialog import RamCommentDialog
 
     class RamsesSyntheyesApp(qw.QMainWindow):
         """The main application window for the Ramses SynthEyes integration."""
@@ -181,6 +221,11 @@ def run_app():
             # so we also refresh when a new shot is loaded into an unsaved scene.
             self._context_cache = {"filePath": None, "_pending_uuid": None, "item": None, "step": None}
 
+            # Daemon connectivity state — pipeline actions are gated on it, and it
+            # is re-checked periodically by the poll timer (see _refresh_daemon_state).
+            self._daemon_online = True
+            self._poll_tick = 0
+
             self.setWindowTitle("Ramses - SynthEyes")
             self.setStyleSheet(
                 "QMainWindow { background-color: #1a1a1a; }"
@@ -188,7 +233,27 @@ def run_app():
             )
 
             self.setup_ui()
+            # Establish the real daemon state before the first paint so buttons
+            # start in the correct enabled/disabled state (online() is patched to
+            # never raise).
+            try:
+                self._daemon_online = bool(ram.RamDaemonInterface.instance().online())
+            except Exception:
+                self._daemon_online = False
             self.refresh_context()
+            if not self._daemon_online:
+                self._set_status("⚠ Ramses is offline — pipeline actions paused.", "warn")
+
+            # The panel is a separate process from SynthEyes, so nothing tells it
+            # when the artist opens/switches a scene directly in SynthEyes. Poll
+            # the current .sni path on a light timer and refresh only when it
+            # actually changes (see _poll_refresh). Focus-in does a full refresh
+            # too (changeEvent) to also pick up status edits made in the Client.
+            # refresh_context() above already seeded self._last_poll_path.
+            self._poll_timer = qc.QTimer(self)
+            self._poll_timer.setInterval(1500)
+            self._poll_timer.timeout.connect(self._poll_refresh)
+            self._poll_timer.start()
 
         def setup_ui(self):
             """Builds the vertical toolbar UI with icons."""
@@ -211,43 +276,101 @@ def run_app():
 
             layout.addSpacing(5)
 
-            # Group 1: Project & Scene  (blue — #2a3442)
-            self.btn_switch = self.create_button("Browse Shots", "ramshot.png", self.on_switch_shot, "#2a3442")
+            # Section palette matches Ramses-Fusion so an artist using both
+            # tools reads the same colour language:
+            #   project=blue  working=teal  publish=green  settings=neutral
+            PROJECT_HUE = "#2c4468"
+            WORKING_HUE = "#2b5a4c"
+            PUBLISH_HUE = "#2f5a32"
+            NEUTRAL_HUE = "#333333"
+            PUBLISH_ACCENT = "#6e4a12"  # amber — the heavy publish action
+
+            # Group 1: Project & Scene
+            self.btn_switch = self.create_button(
+                "Browse Shots", "ramshot.png", self.on_switch_shot, PROJECT_HUE,
+                tooltip="Jump to another shot in this project, or create a new scene from its plate.")
             layout.addWidget(self.btn_switch)
-            self.btn_import = self.create_button("Import Footage", "ramimport.png", self.on_import, "#2a3442")
+            self.btn_import = self.create_button(
+                "Import Footage", "ramimport.png", self.on_import, PROJECT_HUE,
+                tooltip="Load a published plate (image sequence or movie) into the scene as a new shot.")
             layout.addWidget(self.btn_import)
-            self.btn_sync = self.create_button("Sync Settings", "ramsetupscene.png", self.on_sync, "#2a3442")
+            self.btn_sync = self.create_button(
+                "Sync Project Settings", "ramsetupscene.png", self.on_sync, PROJECT_HUE,
+                tooltip="Set the scene resolution, FPS, pixel aspect and frame range from the Ramses project / shot.")
             layout.addWidget(self.btn_sync)
 
             layout.addSpacing(8)
 
-            # Group 2: Working (teal — #2a423d)
-            self.btn_save = self.create_button("Save", "ramsave.png", self.on_save, "#2a423d")
+            # Group 2: Working
+            self.btn_save = self.create_button(
+                "Save", "ramsave.png", self.on_save, WORKING_HUE,
+                tooltip="Save the current working file (overwrites the unversioned working .sni).",
+                prominent=True)  # highest-frequency action
             layout.addWidget(self.btn_save)
-            self.btn_incremental = self.create_button("Save New Version", "ramsaveincremental.png", self.on_incremental, "#2a423d")
+            self.btn_incremental = self.create_button(
+                "Save New Version", "ramsaveincremental.png", self.on_incremental, WORKING_HUE,
+                tooltip="Archive a new numbered version into _versions (e.g. v001 -> v002).")
             layout.addWidget(self.btn_incremental)
-            self.btn_retrieve = self.create_button("Version History / Restore", "ramretrieve.png", self.on_retrieve, "#2a423d")
+            self.btn_comment = self.create_button(
+                "Save with Note", "ramcomment.png", self.on_comment, WORKING_HUE,
+                tooltip="Save the scene and attach a descriptive note to the version in the Ramses database.")
+            layout.addWidget(self.btn_comment)
+            self.btn_retrieve = self.create_button(
+                "Version History / Restore", "ramretrieve.png", self.on_retrieve, WORKING_HUE,
+                tooltip="Browse and restore a previous version of this scene.")
             layout.addWidget(self.btn_retrieve)
-            self.btn_save_as = self.create_button("Save As / Create...", "ramsave.png", self.on_save_as, "#2a423d")
+            self.btn_save_as = self.create_button(
+                "Save As / Create...", "ramsave.png", self.on_save_as, WORKING_HUE,
+                tooltip="Save as a new item or step in the pipeline, or create a new scene.")
             layout.addWidget(self.btn_save_as)
+            self.btn_template = self.create_button(
+                "Save as Template", "ramtemplate.png", self.on_save_template, WORKING_HUE,
+                tooltip="Save the current scene as a template for this step (axis, lens and export setup).")
+            layout.addWidget(self.btn_template)
 
             layout.addSpacing(8)
 
-            # Group 3: Publish (green — #2a422a)
-            self.btn_preview = self.create_button("Save Preview", "rampreview.png", self.on_preview, "#2a422a")
+            # Group 3: Publish
+            self.btn_preview = self.create_button(
+                "Save Preview", "rampreview.png", self.on_preview, PUBLISH_HUE,
+                tooltip="Render the tracking overlay to the shot's _preview folder for supervisor review.")
             layout.addWidget(self.btn_preview)
-            self.btn_export = self.create_button("Export to Pipeline", "rampublishsettings.png", self.on_export, "#2a422a")
+            self.btn_open_preview = self.create_button(
+                "Open Preview", "ramopen.png", self.on_open_preview, PUBLISH_HUE,
+                tooltip="Open the most recent preview for this shot in your default viewer.")
+            layout.addWidget(self.btn_open_preview)
+            self.btn_export = self.create_button(
+                "Export to Pipeline", "rampublishsettings.png", self.on_export, PUBLISH_ACCENT,
+                tooltip="Export the tracking data (Fusion comp by default) to the step's _published folder, where Ramses-Fusion picks it up.",
+                prominent=True)  # heaviest action
             layout.addWidget(self.btn_export)
-            self.btn_status = self.create_button("Update Status", "ramstatus.png", self.on_status, "#2a422a")
+            self.btn_status = self.create_button(
+                "Update Status", "ramstatus.png", self.on_status, PUBLISH_HUE,
+                tooltip="Set the shot's state, completion ratio and a comment in the Ramses database.")
             layout.addWidget(self.btn_status)
 
             layout.addSpacing(8)
 
-            # Group 4: Settings (neutral — #333333)
-            self.btn_update = self.create_button("Check for Update", "ramupdate.png", self.on_check_update, "#333333")
+            # Group 4: Settings
+            self.btn_settings = self.create_button(
+                "Settings", "ramsettings.png", self.on_settings, NEUTRAL_HUE,
+                tooltip="Configure plate step names, start frame and debug logging.")
+            layout.addWidget(self.btn_settings)
+            self.btn_update = self.create_button(
+                "Check for Update", "ramupdate.png", self.on_check_update, NEUTRAL_HUE,
+                tooltip="Check whether a newer version of the Ramses SynthEyes plugin is available.")
             layout.addWidget(self.btn_update)
 
             layout.addStretch()
+
+            # Inline status line — non-blocking feedback that replaces the modal
+            # popups. Coloured by kind via _set_status (ok/warn/error/info).
+            self.status_line = qw.QLabel("")
+            self.status_line.setWordWrap(True)
+            self.status_line.setStyleSheet(
+                "QLabel { color: #888888; font-size: 11px; padding: 2px 4px; }"
+            )
+            layout.addWidget(self.status_line)
 
             # Footer version label
             self.btn_about = qw.QPushButton("Ramses v" + self.host.version)
@@ -256,32 +379,116 @@ def run_app():
             self.btn_about.clicked.connect(self.on_about)
             layout.addWidget(self.btn_about)
 
-        def create_button(self, text, icon_name, callback, accent_color=None):
+        def create_button(self, text, icon_name, callback, accent_color=None,
+                           tooltip="", prominent=False):
+            """Builds a left-aligned icon+text button.
+
+            prominent makes the button taller (36px) and semibold — used to give
+            the highest-frequency action (Save) and the heaviest one (Export to
+            Pipeline) more visual weight than the routine buttons around them.
+            """
             btn = qw.QPushButton(" " + text)
-            btn.setMinimumHeight(30)
-            btn.setMaximumHeight(30)
+            height = 36 if prominent else 30
+            btn.setMinimumHeight(height)
+            btn.setMaximumHeight(height)
+            if tooltip:
+                btn.setToolTip(tooltip)
             icon_path = os.path.join(script_dir, "icons", icon_name)
             if os.path.exists(icon_path):
                 btn.setIcon(qg.QIcon(icon_path))
                 btn.setIconSize(qc.QSize(16, 16))
             btn.clicked.connect(callback)
 
+            weight_css = "font-weight: 600;" if prominent else ""
             if accent_color:
                 h = accent_color.lstrip("#")
                 hr, hg, hb = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
                 hover   = "#%02x%02x%02x" % (min(255, hr+15), min(255, hg+15), min(255, hb+15))
                 pressed = "#%02x%02x%02x" % (max(0, hr-10),   max(0, hg-10),   max(0, hb-10))
                 ss = (
-                    f"QPushButton {{ text-align: left; padding-left: 12px;"
+                    f"QPushButton {{ text-align: left; padding-left: 12px; {weight_css}"
                     f" border: 1px solid #222; border-radius: 3px; background-color: {accent_color}; }}"
                     f"QPushButton:hover {{ background-color: {hover}; }}"
                     f"QPushButton:pressed {{ background-color: {pressed}; }}"
                     "QPushButton:disabled { background-color: #222; color: #555; border: 1px solid #1a1a1a; }"
                 )
             else:
-                ss = "QPushButton { text-align: left; padding-left: 12px; border: 1px solid #222; border-radius: 3px; }"
+                ss = (
+                    f"QPushButton {{ text-align: left; padding-left: 12px; {weight_css}"
+                    " border: 1px solid #222; border-radius: 3px; }"
+                )
             btn.setStyleSheet(ss)
             return btn
+
+        _STATUS_COLORS = {
+            "ok": "#6ab04c",
+            "warn": "#e1b12c",
+            "error": "#eb4d4b",
+            "info": "#888888",
+        }
+
+        def _set_status(self, text: str, kind: str = "info") -> None:
+            """Shows a one-line, non-blocking status message under the buttons.
+
+            kind is one of ok / warn / error / info and selects the colour.
+            """
+            line = getattr(self, "status_line", None)
+            if line is None:
+                return
+            color = self._STATUS_COLORS.get(kind, self._STATUS_COLORS["info"])
+            line.setStyleSheet(
+                f"QLabel {{ color: {color}; font-size: 11px; padding: 2px 4px; }}"
+            )
+            line.setText(text)
+
+        def _poll_refresh(self):
+            """Timer tick: refresh the header when the .sni path changed, and
+            re-check daemon connectivity roughly every 6s.
+
+            The path check is a single cheap SNIFileName() read per tick; the
+            daemon ping is throttled to every 4th tick so it doesn't hammer the
+            socket. A full refresh (which re-reads status) also happens on
+            focus-in via changeEvent.
+            """
+            self._poll_tick += 1
+            if self._poll_tick % 4 == 0:
+                self._refresh_daemon_state()
+            try:
+                path = self.host.currentFilePath()
+            except Exception:
+                return  # listener hiccup — try again next tick
+            if path != self._last_poll_path:
+                self._last_poll_path = path
+                self.refresh_context()
+
+        def _refresh_daemon_state(self):
+            """Re-check the Ramses daemon; on a state change, re-gate the buttons.
+
+            online() is patched to never raise, but the extra guard keeps a
+            listener/socket hiccup from bubbling out of the timer callback.
+            """
+            try:
+                online = bool(ram.RamDaemonInterface.instance().online())
+            except Exception:
+                online = False
+            if online == self._daemon_online:
+                return
+            self._daemon_online = online
+            self.refresh_context()  # re-gate buttons for the new state
+            if online:
+                self._set_status("✓ Reconnected to Ramses.", "ok")
+            else:
+                self._set_status("⚠ Ramses is offline — pipeline actions paused.", "warn")
+
+        def changeEvent(self, event):
+            """Refresh when the panel regains focus (picks up external edits)."""
+            try:
+                if event.type() == qc.QEvent.ActivationChange and self.isActiveWindow():
+                    # refresh_context() re-reads status and re-seeds the poll baseline.
+                    self.refresh_context()
+            except Exception:
+                pass
+            super(RamsesSyntheyesApp, self).changeEvent(event)
 
         def refresh_context(self):
             """Updates the context label and button states based on current file."""
@@ -289,6 +496,9 @@ def run_app():
             # where a new shot is loaded into an unsaved (path == "") scene, because
             # the path never changes even though the pending identity has.
             current_path = self.host.currentFilePath()
+            # Keep the poll baseline in sync so a refresh triggered here (by a
+            # handler or focus-in) doesn't make the next timer tick re-fire.
+            self._last_poll_path = current_path
             pending_uuid = None
             if not current_path:
                 pending = getattr(self.host, "_pending_new_shot_item", None)
@@ -366,13 +576,23 @@ def run_app():
                 else:
                     self.context_label.setText("<font color='#cc9900'>No Active Scene</font>")
 
-            # Buttons that require a pipeline context (known item + step)
-            for btn in (self.btn_save, self.btn_incremental, self.btn_retrieve,
-                        self.btn_sync, self.btn_preview, self.btn_export, self.btn_status):
-                btn.setEnabled(in_pipeline)
+            online = self._daemon_online
 
-            # Save As / Create is always available (used to enter the pipeline)
-            # Browse Shots, Check for Update, About are always available
+            # Buttons that require a pipeline context (known item + step) AND the
+            # daemon (they read/write the database).
+            for btn in (self.btn_save, self.btn_incremental, self.btn_comment,
+                        self.btn_retrieve, self.btn_template, self.btn_sync,
+                        self.btn_preview, self.btn_open_preview, self.btn_export,
+                        self.btn_status):
+                btn.setEnabled(in_pipeline and online)
+
+            # Buttons that need the daemon to browse/list, but not a current
+            # context: they enter the pipeline.
+            for btn in (self.btn_switch, self.btn_import, self.btn_save_as):
+                btn.setEnabled(online)
+
+            # Settings, Check for Update and About never need the daemon and stay
+            # enabled at all times.
 
         # --- Handlers ---
 
@@ -380,26 +600,50 @@ def run_app():
             """Import published footage (image sequence or movie) from a previous step."""
             if self.host.importItem():
                 self.refresh_context()
+                self._set_status("✓ Imported footage into the scene.", "ok")
 
         def on_sync(self):
             """Manually sync scene settings."""
             if self.host.setupCurrentFile():
-                qw.QMessageBox.information(self, "Ramses", "Scene settings synced with database.")
+                self._set_status("✓ Scene settings synced (resolution, FPS, range).", "ok")
             else:
-                qw.QMessageBox.warning(self, "Ramses", "Could not sync scene settings.\nMake sure a Ramses shot is active.")
+                self._set_status("Could not sync — make sure a Ramses shot is active.", "warn")
 
         def on_preview(self):
             """Render and save a preview sequence (no .comp export)."""
             try:
-                self.host.savePreview()
+                # savePreview() returns False only when the scene isn't saved yet;
+                # None (falsy) is the normal success return.
+                if self.host.savePreview() is False:
+                    self._set_status("Save the scene before creating a preview.", "warn")
+                else:
+                    self._set_status(f"✓ Preview saved · {time.strftime('%H:%M')}", "ok")
             except Exception as e:
-                qw.QMessageBox.critical(self, "Preview Failed",
-                    f"Could not save preview:\n{e}")
+                self.host._log(f"Preview failed: {e}", ram.LogLevel.Critical)
+                self._set_status("Preview failed — see the SynthEyes console.", "error")
             self.refresh_context()
+
+        def on_open_preview(self):
+            """Open the most recent preview for this shot in the default viewer."""
+            try:
+                preview_path = self.host.resolvePreviewPath()
+            except Exception as e:
+                self.host._log(f"Could not resolve preview path: {e}", ram.LogLevel.Critical)
+                self._set_status("Could not resolve the preview path.", "error")
+                return
+            if not preview_path or not os.path.exists(preview_path):
+                self._set_status("No preview yet — use Save Preview first.", "warn")
+                return
+            # QDesktopServices picks the OS default handler for the file type.
+            qg.QDesktopServices.openUrl(qc.QUrl.fromLocalFile(preview_path))
+            self._set_status("Opened preview in the default viewer.", "ok")
 
         def on_export(self):
             """Export tracking data via the Ramses publish lifecycle."""
-            self.host.publish(forceShowPublishUI=True)
+            if self.host.publish(forceShowPublishUI=True):
+                self._set_status(f"✓ Exported to pipeline · {time.strftime('%H:%M')}", "ok")
+            else:
+                self._set_status("Export did not complete — see the SynthEyes console.", "warn")
             self.refresh_context()
 
         def on_open(self):
@@ -407,24 +651,77 @@ def run_app():
                 self.refresh_context()
 
         def on_save(self):
-            self.host.save()
+            if self.host.save():
+                self._set_status(f"✓ Saved · {time.strftime('%H:%M')}", "ok")
+            else:
+                self._set_status("Save failed — see the SynthEyes console.", "error")
             self.refresh_context()
 
         def on_incremental(self):
-            self.host.save(incremental=True)
+            if self.host.save(incremental=True):
+                self._set_status(f"✓ Saved new version · {time.strftime('%H:%M')}", "ok")
+            else:
+                self._set_status("Save failed — see the SynthEyes console.", "error")
             self.refresh_context()
+
+        def on_comment(self):
+            """Save the scene and attach a note to the current version."""
+            host = self.host
+            status = host.currentStatus()
+            current_note = status.comment() if status else ""
+            state = status.state() if status else None
+            current_version = host.currentVersion()
+
+            dialog = RamCommentDialog(current_version, current_note)
+            dialog.setWindowFlags(dialog.windowFlags() | qc.Qt.WindowStaysOnTopHint)
+            dialog.raise_()
+            dialog.activateWindow()
+            if not _exec_compat(dialog):
+                return
+
+            new_note = dialog.comment()
+            if new_note == current_note:
+                self._set_status("Note unchanged — nothing saved.", "info")
+                return
+
+            # Non-incremental save-over that records the note against the current
+            # version, tagged with the existing state (mirrors Ramses-Fusion).
+            if host.save(comment=new_note, state=state):
+                if status:
+                    status.setComment(new_note)
+                self.refresh_context()
+                self._set_status(f"✓ Saved with note · {time.strftime('%H:%M')}", "ok")
+            else:
+                self._set_status("Save failed — see the SynthEyes console.", "error")
 
         def on_retrieve(self):
             if self.host.restoreVersion():
                 self.refresh_context()
+                self._set_status("✓ Version restored.", "ok")
 
         def on_save_as(self):
             if self.host.saveAs():
                 self.refresh_context()
+                self._set_status("✓ Saved into the pipeline.", "ok")
+
+        def on_save_template(self):
+            """Save the current scene as a reusable template for this step."""
+            if not self.host.currentStep():
+                self._set_status("No step — open or create a shot first.", "warn")
+                return
+            name, ok = qw.QInputDialog.getText(
+                self, "Save as Template", "Template name:", text="NewTemplate")
+            if not ok or not name.strip():
+                return
+            if self.host.saveAsTemplate(name):
+                self._set_status(f"✓ Template '{name.strip()}' saved.", "ok")
+            else:
+                self._set_status("Could not save template — see the SynthEyes console.", "warn")
 
         def on_switch_shot(self):
             if self.host.open():
                 self.refresh_context()
+                self._set_status("✓ Shot loaded.", "ok")
 
         def on_status(self):
             if self.host.updateStatus():
@@ -435,6 +732,7 @@ def run_app():
                     ram.RamDaemonInterface.instance()._cache.pop('data', None)
                 except AttributeError:
                     pass  # SDK version without this internal cache — no-op
+                self._set_status("✓ Status updated.", "ok")
             self.refresh_context()
 
         def on_check_update(self):
@@ -447,6 +745,61 @@ def run_app():
                 dialog.raise_()
                 dialog.activateWindow()
                 _exec_compat(dialog)
+
+        def on_settings(self):
+            """Edit the user-facing settings without hand-editing the JSON file."""
+            us = self.settings.userSettings
+
+            dialog = qw.QDialog(self)
+            dialog.setWindowTitle("Ramses SynthEyes — Settings")
+            dialog.setMinimumWidth(420)
+            layout = qw.QVBoxLayout(dialog)
+
+            form = qw.QFormLayout()
+            layout.addLayout(form)
+
+            plate_names = us.get("plateStepNames", list(DEFAULT_PLATE_STEP_NAMES))
+            plate_edit = qw.QLineEdit(", ".join(str(n) for n in plate_names))
+            plate_edit.setToolTip(
+                "Step short names searched (in order) for the source plate when "
+                "creating a new scene. Comma-separated; case-insensitive.")
+            form.addRow("Plate step names:", plate_edit)
+
+            start_spin = qw.QSpinBox()
+            start_spin.setRange(0, 1000000)
+            start_spin.setValue(int(us.get("compStartFrame", 1001)))
+            start_spin.setToolTip("First frame number applied to the scene's frame range.")
+            form.addRow("Start frame:", start_spin)
+
+            debug_check = qw.QCheckBox("Verbose debug logging to the console")
+            debug_check.setChecked(bool(us.get("debugLog", False)))
+            form.addRow("Diagnostics:", debug_check)
+
+            buttons = qw.QDialogButtonBox(
+                qw.QDialogButtonBox.Save | qw.QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            dialog.setWindowFlags(dialog.windowFlags() | qc.Qt.WindowStaysOnTopHint)
+            dialog.raise_()
+            dialog.activateWindow()
+            if not _exec_compat(dialog):
+                return
+
+            # Persist. Keep an existing plate list rather than wiping it if the
+            # field was cleared to empty — an empty list disables plate lookup.
+            names = [n.strip() for n in plate_edit.text().split(",") if n.strip()]
+            if names:
+                us["plateStepNames"] = names
+            us["compStartFrame"] = int(start_spin.value())
+            us["debugLog"] = bool(debug_check.isChecked())
+            try:
+                self.settings.save()
+                self._set_status("✓ Settings saved.", "ok")
+            except Exception as e:
+                self.host._log(f"Failed to save settings: {e}", ram.LogLevel.Critical)
+                self._set_status("Could not save settings — see the console.", "error")
 
         def on_about(self):
             dialog = RamAboutDialog()

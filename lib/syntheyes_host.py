@@ -3,16 +3,13 @@ import os
 import time
 import json
 import re
-try:
-    import ramses.yaml as yaml
-except ImportError:
-    import yaml
 from ramses import (
     RamHost,
     RamItem,
     RamStep,
     RamStatus,
     RamFileInfo,
+    RamFileManager,
     LogLevel,
     ItemType,
     RAMSES,
@@ -20,6 +17,24 @@ from ramses import (
     RamMetaDataManager,
     RamState,
 )
+
+# =============================================================================
+# APPLY RUNTIME PATCHES
+# =============================================================================
+# Fix the vendored SDK's data-loss / crash bugs at runtime (see ramses_patches).
+# This module is imported early by the entry script, so patching here installs
+# the fixes before any metadata or daemon call is made.
+try:
+    import ramses_patches
+    ramses_patches.apply()
+    from ramses_patches import DisableMakedirs
+except ImportError:
+    print(
+        "[Ramses] Warning: ramses_patches module not found. Critical fixes may be missing."
+    )
+    # Read-only probes below use `with DisableMakedirs():` - degrade to a
+    # no-op context manager rather than crashing if the patches are missing.
+    from contextlib import nullcontext as DisableMakedirs
 
 # Steps that hold ingested source plates. Same convention (and same user
 # setting, "plateStepNames") as Ramses-Fusion.
@@ -135,9 +150,13 @@ class SynthEyesHost(RamHost):
             try:
                 if str(p_step.shortName()).lower() not in names:
                     continue
-                plate = self._pick_footage_file(
-                    item.latestPublishedVersionFilePaths(step=p_step)
-                )
+                # Read-only probe: without DisableMakedirs this creates a
+                # _published folder in every plate step just to look for the
+                # latest plate (SDK path getters mkdir on read).
+                with DisableMakedirs():
+                    plate = self._pick_footage_file(
+                        item.latestPublishedVersionFilePaths(step=p_step)
+                    )
                 if plate:
                     return plate
             except Exception:
@@ -176,6 +195,27 @@ class SynthEyesHost(RamHost):
             return self.normalizePath(path)
         except Exception:
             return ""
+
+    def resolvePreviewPath(self) -> str:
+        """Returns the most recent preview file for the current shot, or "".
+
+        Used by the panel's 'Open Preview' button. Reads the shot's preview
+        folder (read-only — no mkdir) and returns the newest media file in it,
+        which is the preview the artist most recently rendered.
+        """
+        with DisableMakedirs():
+            folder = self.previewPath()
+        if not folder or not os.path.isdir(folder):
+            return ""
+        candidates = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if os.path.splitext(f)[1].lower() in _FOOTAGE_EXTENSIONS
+            and os.path.isfile(os.path.join(folder, f))
+        ]
+        if not candidates:
+            return ""
+        return self.normalizePath(max(candidates, key=os.path.getmtime))
 
     def _isDirty(self) -> bool:
         """Checks if the current scene has unsaved changes."""
@@ -809,6 +849,59 @@ class SynthEyesHost(RamHost):
                         path = os.path.join(step_folder, nm.fileName())
         return self.normalizePath(path) if path else ""
 
+    def saveAsTemplate(self, name: str, step: RamStep = None) -> str:
+        """Saves the current scene as a template in the step's templates folder.
+
+        The scene must already be saved on disk: we flush the latest changes to
+        the working file and copy it into the templates folder, so the working
+        file keeps its own identity (mirrors Ramses-Fusion's template flow).
+
+        Returns the template path on success, or "" on failure.
+        """
+        if not self._ensure_connected():
+            return ""
+        step = step or self.currentStep()
+        if not step:
+            self._log("Cannot save template: no current step.", LogLevel.Warning)
+            return ""
+
+        clean = re.sub(r"[^A-Za-z0-9_]", "", name.replace(" ", "_").replace("-", "_"))
+        if not clean:
+            self._log("Cannot save template: the name is empty after sanitising.", LogLevel.Warning)
+            return ""
+
+        src = self.currentFilePath()
+        if not src or not os.path.isfile(src):
+            self._log("Cannot save template: save the scene first.", LogLevel.Warning)
+            return ""
+
+        tpl_folder = step.templatesFolderPath()
+        if not tpl_folder:
+            self._log("Cannot save template: the step has no templates folder.", LogLevel.Warning)
+            return ""
+
+        # For GENERAL-type files RamFileInfo.fileName() omits shortName, so the
+        # template name goes in the resource field (which IS included) to keep
+        # each template uniquely named: PROJ_G_<step>_<name>.sni
+        nm = RamFileInfo()
+        nm.project = step.projectShortName()
+        nm.ramType = ItemType.GENERAL
+        nm.step = step.shortName()
+        nm.resource = clean
+        nm.extension = "sni"
+        target = self.normalizePath(os.path.join(tpl_folder, nm.fileName()))
+
+        try:
+            # Flush the current scene, then copy it to the template path.
+            self._markDirtyAndSave(src)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            RamFileManager.copy(src, target, separateThread=False)
+            self._log(f"Template saved to: {target}", LogLevel.Info)
+            return target
+        except Exception as e:
+            self._log(f"Failed to save template: {e}", LogLevel.Critical)
+            return ""
+
     def _openUI(self, item: RamItem = None, step: RamStep = None) -> dict:
         """Shows the Ramses Open Dialog for opening or creating a scene."""
         if hasattr(self, 'app') and self.app:
@@ -1234,66 +1327,81 @@ class SynthEyesHost(RamHost):
         if not showPublishUI:
             return options
 
-        # Convert dict to YAML for editing
-        try:
-            current_yaml = yaml.dump(options, default_flow_style=False)
-        except Exception:
-            current_yaml = ""
-
-        yaml_label = (
-            "exportType         — name from SynthEyes File › Export menu\n"
-            "previewFormat      — image seq: jpg png exr dpx tif  |  movie: avi mov mp4\n"
-            "previewRenderSettings    — advanced: SynthEyes channel string (empty = scene default)\n"
-            "previewRenderCompression — advanced: SynthEyes codec string   (empty = scene default)"
-        )
-
+        # A small form (replaces the old hand-edited-YAML editor). Editable
+        # combo boxes give discoverability while still allowing any value.
         try:
             try:
-                from PySide2 import QtWidgets as qw, QtGui as qg
+                from PySide2 import QtWidgets as qw
+                from PySide2 import QtCore as qc
             except ImportError:
-                from PySide6 import QtWidgets as qw, QtGui as qg
+                from PySide6 import QtWidgets as qw
+                from PySide6 import QtCore as qc
 
-            # Loop instead of recurse — each bad YAML submission re-shows the
-            # same dialog with the user's edits preserved, without stacking calls.
-            while True:
-                dialog = qw.QDialog()
-                dialog.setWindowTitle("Export Settings")
-                dialog.setMinimumWidth(520)
-                layout = qw.QVBoxLayout(dialog)
+            dialog = qw.QDialog()
+            dialog.setWindowTitle("Export Settings")
+            dialog.setMinimumWidth(460)
+            layout = qw.QVBoxLayout(dialog)
+            form = qw.QFormLayout()
+            layout.addLayout(form)
 
-                layout.addWidget(qw.QLabel("Settings (YAML):"))
-                layout.addWidget(qw.QLabel(yaml_label))
+            # Tracking-data export type — must match a File › Export menu entry.
+            export_combo = qw.QComboBox()
+            export_combo.setEditable(True)
+            for name in ("Fusion Composition", "Nuke (.nk)", "After Effects (.jsx)",
+                         "Maya (.ma)", "3DS Max (.ms)"):
+                export_combo.addItem(name)
+            export_combo.setEditText(str(options.get("exportType", "Fusion Composition")))
+            export_combo.setToolTip(
+                "Must match an entry in the SynthEyes File › Export menu exactly.")
+            form.addRow("Export type:", export_combo)
 
-                editor = qw.QPlainTextEdit()
-                editor.setFont(qg.QFont("Courier New", 9))
-                editor.setPlainText(current_yaml)
-                editor.setMinimumHeight(300)
-                layout.addWidget(editor)
+            # Preview output format (file extension).
+            preview_combo = qw.QComboBox()
+            preview_combo.setEditable(True)
+            for ext in ("jpg", "png", "exr", "dpx", "tif", "avi", "mov", "mp4"):
+                preview_combo.addItem(ext)
+            preview_combo.setEditText(str(options.get("previewFormat", "jpg")).lstrip("."))
+            preview_combo.setToolTip(
+                "Image sequence: jpg png exr dpx tif   |   movie: avi mov mp4")
+            form.addRow("Preview format:", preview_combo)
 
-                buttons = qw.QDialogButtonBox(
-                    qw.QDialogButtonBox.Ok | qw.QDialogButtonBox.Cancel
-                )
-                buttons.accepted.connect(dialog.accept)
-                buttons.rejected.connect(dialog.reject)
-                layout.addWidget(buttons)
+            # Advanced overrides — empty means "use the scene's current setting".
+            settings_edit = qw.QLineEdit(str(options.get("previewRenderSettings", "")))
+            settings_edit.setPlaceholderText("empty = use the scene's current channel setting")
+            settings_edit.setToolTip(
+                "Advanced: SynthEyes channel-selection string. Leave empty for the scene default.")
+            form.addRow("Render settings:", settings_edit)
 
-                dialog.raise_()
-                dialog.activateWindow()
-                accepted = self._exec_dialog(dialog)
+            compression_edit = qw.QLineEdit(str(options.get("previewRenderCompression", "")))
+            compression_edit.setPlaceholderText("empty = use the scene's current codec")
+            compression_edit.setToolTip(
+                "Advanced: SynthEyes codec string. Leave empty for the scene default.")
+            form.addRow("Render codec:", compression_edit)
 
-                if not accepted:
-                    return None  # User cancelled
+            buttons = qw.QDialogButtonBox(
+                qw.QDialogButtonBox.Ok | qw.QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
 
-                try:
-                    new_options = yaml.safe_load(editor.toPlainText())
-                    if isinstance(new_options, dict):
-                        return new_options
-                    self._log("Publish settings YAML must be a mapping.", LogLevel.Warning)
-                except Exception as e:
-                    self._log(f"Invalid YAML in publish settings: {e}", LogLevel.Warning)
+            dialog.setWindowFlags(dialog.windowFlags() | qc.Qt.WindowStaysOnTopHint)
+            dialog.raise_()
+            dialog.activateWindow()
+            if not self._exec_dialog(dialog):
+                return None  # User cancelled
 
-                # Invalid YAML — preserve the user's text and loop back
-                current_yaml = editor.toPlainText()
+            # Start from the merged options so any extra keys a step carries are
+            # preserved; override only the four fields the form exposes.
+            result = dict(options)
+            export_type = export_combo.currentText().strip()
+            if export_type:
+                result["exportType"] = export_type
+            preview_fmt = preview_combo.currentText().strip().lstrip(".")
+            if preview_fmt:
+                result["previewFormat"] = preview_fmt
+            result["previewRenderSettings"] = settings_edit.text().strip()
+            result["previewRenderCompression"] = compression_edit.text().strip()
+            return result
 
         except Exception as e:
             self._log(f"Could not show publish settings UI: {e}", LogLevel.Warning)
@@ -1303,9 +1411,26 @@ class SynthEyesHost(RamHost):
         return publishOptions
 
     def _replace(self, filePaths: list, item: RamItem, step: RamStep, importOptions: list, forceShowImportUI: bool) -> bool:
+        """Deliberately unimplemented — see note below.
+
+        In Ramses-Fusion, Replace swaps a Loader's footage to a different
+        published version in place. The SynthEyes analog would be re-pointing
+        the current shot's footage to a different published plate version while
+        keeping the existing solve.
+
+        SynthEyes binds footage at shot-creation time (NewSceneAndShot /
+        AddShot) and exposes NO supported SyPy or Sizzle call to change the
+        image source of an existing shot; a blind write to the internal
+        'filenam' attribute would risk silently desyncing the RAM cache and
+        trackers from the new footage. Rather than ship a corrupting guess,
+        Replace is deferred until a safe footage-repoint path is available
+        (e.g. via Boris FX support). To move to a new plate today, create a new
+        scene from it via 'Browse Shots'.
+        """
         return False
 
     def _replaceUI(self, item: RamItem, step: RamStep) -> dict:
+        """Unused — Replace is deferred (see _replace for the reason)."""
         return None
 
     def _restoreVersionUI(self, versionFiles: list) -> str:
