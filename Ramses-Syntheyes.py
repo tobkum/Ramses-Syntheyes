@@ -261,40 +261,73 @@ def run_app():
 
             layout.addSpacing(5)
 
-            # Group 1: Project & Scene  (blue — #2a3442)
-            self.btn_switch = self.create_button("Browse Shots", "ramshot.png", self.on_switch_shot, "#2a3442")
+            # Section palette matches Ramses-Fusion so an artist using both
+            # tools reads the same colour language:
+            #   project=blue  working=teal  publish=green  settings=neutral
+            PROJECT_HUE = "#2c4468"
+            WORKING_HUE = "#2b5a4c"
+            PUBLISH_HUE = "#2f5a32"
+            NEUTRAL_HUE = "#333333"
+            PUBLISH_ACCENT = "#6e4a12"  # amber — the heavy publish action
+
+            # Group 1: Project & Scene
+            self.btn_switch = self.create_button(
+                "Browse Shots", "ramshot.png", self.on_switch_shot, PROJECT_HUE,
+                tooltip="Jump to another shot in this project, or create a new scene from its plate.")
             layout.addWidget(self.btn_switch)
-            self.btn_import = self.create_button("Import Footage", "ramimport.png", self.on_import, "#2a3442")
+            self.btn_import = self.create_button(
+                "Import Footage", "ramimport.png", self.on_import, PROJECT_HUE,
+                tooltip="Load a published plate (image sequence or movie) into the scene as a new shot.")
             layout.addWidget(self.btn_import)
-            self.btn_sync = self.create_button("Sync Settings", "ramsetupscene.png", self.on_sync, "#2a3442")
+            self.btn_sync = self.create_button(
+                "Sync Project Settings", "ramsetupscene.png", self.on_sync, PROJECT_HUE,
+                tooltip="Set the scene resolution, FPS, pixel aspect and frame range from the Ramses project / shot.")
             layout.addWidget(self.btn_sync)
 
             layout.addSpacing(8)
 
-            # Group 2: Working (teal — #2a423d)
-            self.btn_save = self.create_button("Save", "ramsave.png", self.on_save, "#2a423d")
+            # Group 2: Working
+            self.btn_save = self.create_button(
+                "Save", "ramsave.png", self.on_save, WORKING_HUE,
+                tooltip="Save the current working file (overwrites the unversioned working .sni).",
+                prominent=True)  # highest-frequency action
             layout.addWidget(self.btn_save)
-            self.btn_incremental = self.create_button("Save New Version", "ramsaveincremental.png", self.on_incremental, "#2a423d")
+            self.btn_incremental = self.create_button(
+                "Save New Version", "ramsaveincremental.png", self.on_incremental, WORKING_HUE,
+                tooltip="Archive a new numbered version into _versions (e.g. v001 -> v002).")
             layout.addWidget(self.btn_incremental)
-            self.btn_retrieve = self.create_button("Version History / Restore", "ramretrieve.png", self.on_retrieve, "#2a423d")
+            self.btn_retrieve = self.create_button(
+                "Version History / Restore", "ramretrieve.png", self.on_retrieve, WORKING_HUE,
+                tooltip="Browse and restore a previous version of this scene.")
             layout.addWidget(self.btn_retrieve)
-            self.btn_save_as = self.create_button("Save As / Create...", "ramsave.png", self.on_save_as, "#2a423d")
+            self.btn_save_as = self.create_button(
+                "Save As / Create...", "ramsave.png", self.on_save_as, WORKING_HUE,
+                tooltip="Save as a new item or step in the pipeline, or create a new scene.")
             layout.addWidget(self.btn_save_as)
 
             layout.addSpacing(8)
 
-            # Group 3: Publish (green — #2a422a)
-            self.btn_preview = self.create_button("Save Preview", "rampreview.png", self.on_preview, "#2a422a")
+            # Group 3: Publish
+            self.btn_preview = self.create_button(
+                "Save Preview", "rampreview.png", self.on_preview, PUBLISH_HUE,
+                tooltip="Render the tracking overlay to the shot's _preview folder for supervisor review.")
             layout.addWidget(self.btn_preview)
-            self.btn_export = self.create_button("Export to Pipeline", "rampublishsettings.png", self.on_export, "#2a422a")
+            self.btn_export = self.create_button(
+                "Export to Pipeline", "rampublishsettings.png", self.on_export, PUBLISH_ACCENT,
+                tooltip="Export the tracking data (Fusion comp by default) to the step's _published folder, where Ramses-Fusion picks it up.",
+                prominent=True)  # heaviest action
             layout.addWidget(self.btn_export)
-            self.btn_status = self.create_button("Update Status", "ramstatus.png", self.on_status, "#2a422a")
+            self.btn_status = self.create_button(
+                "Update Status", "ramstatus.png", self.on_status, PUBLISH_HUE,
+                tooltip="Set the shot's state, completion ratio and a comment in the Ramses database.")
             layout.addWidget(self.btn_status)
 
             layout.addSpacing(8)
 
-            # Group 4: Settings (neutral — #333333)
-            self.btn_update = self.create_button("Check for Update", "ramupdate.png", self.on_check_update, "#333333")
+            # Group 4: Settings
+            self.btn_update = self.create_button(
+                "Check for Update", "ramupdate.png", self.on_check_update, NEUTRAL_HUE,
+                tooltip="Check whether a newer version of the Ramses SynthEyes plugin is available.")
             layout.addWidget(self.btn_update)
 
             layout.addStretch()
@@ -315,30 +348,44 @@ def run_app():
             self.btn_about.clicked.connect(self.on_about)
             layout.addWidget(self.btn_about)
 
-        def create_button(self, text, icon_name, callback, accent_color=None):
+        def create_button(self, text, icon_name, callback, accent_color=None,
+                           tooltip="", prominent=False):
+            """Builds a left-aligned icon+text button.
+
+            prominent makes the button taller (36px) and semibold — used to give
+            the highest-frequency action (Save) and the heaviest one (Export to
+            Pipeline) more visual weight than the routine buttons around them.
+            """
             btn = qw.QPushButton(" " + text)
-            btn.setMinimumHeight(30)
-            btn.setMaximumHeight(30)
+            height = 36 if prominent else 30
+            btn.setMinimumHeight(height)
+            btn.setMaximumHeight(height)
+            if tooltip:
+                btn.setToolTip(tooltip)
             icon_path = os.path.join(script_dir, "icons", icon_name)
             if os.path.exists(icon_path):
                 btn.setIcon(qg.QIcon(icon_path))
                 btn.setIconSize(qc.QSize(16, 16))
             btn.clicked.connect(callback)
 
+            weight_css = "font-weight: 600;" if prominent else ""
             if accent_color:
                 h = accent_color.lstrip("#")
                 hr, hg, hb = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
                 hover   = "#%02x%02x%02x" % (min(255, hr+15), min(255, hg+15), min(255, hb+15))
                 pressed = "#%02x%02x%02x" % (max(0, hr-10),   max(0, hg-10),   max(0, hb-10))
                 ss = (
-                    f"QPushButton {{ text-align: left; padding-left: 12px;"
+                    f"QPushButton {{ text-align: left; padding-left: 12px; {weight_css}"
                     f" border: 1px solid #222; border-radius: 3px; background-color: {accent_color}; }}"
                     f"QPushButton:hover {{ background-color: {hover}; }}"
                     f"QPushButton:pressed {{ background-color: {pressed}; }}"
                     "QPushButton:disabled { background-color: #222; color: #555; border: 1px solid #1a1a1a; }"
                 )
             else:
-                ss = "QPushButton { text-align: left; padding-left: 12px; border: 1px solid #222; border-radius: 3px; }"
+                ss = (
+                    f"QPushButton {{ text-align: left; padding-left: 12px; {weight_css}"
+                    " border: 1px solid #222; border-radius: 3px; }"
+                )
             btn.setStyleSheet(ss)
             return btn
 
