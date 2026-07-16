@@ -72,9 +72,48 @@ def _release_instance_lock():
     except OSError:
         pass
 
+def _quarantine_corrupt_addon_settings():
+    """Moves a corrupt add-on settings file aside so startup can't hard-crash.
+
+    RamSettings loads ${APPDATA}/Ramses/Config/ramses_addons_settings.json on
+    the first `import ramses`; a truncated or malformed JSON there would raise
+    deep in the SDK before the UI ever appears. Rename it to *.corrupt and let
+    the SDK fall back to defaults. Only the platforms the SDK itself handles
+    (Windows, Linux) are covered — it doesn't define a Darwin config path.
+    """
+    import platform as _platform
+    system = _platform.system()
+    if system == "Windows":
+        folder = os.path.expandvars("${APPDATA}/Ramses/Config")
+    elif system == "Linux":
+        folder = os.path.expanduser("~/.config/Ramses/Config")
+    else:
+        return
+    settings_file = os.path.join(folder, "ramses_addons_settings.json")
+    if not os.path.isfile(settings_file):
+        return
+    try:
+        with open(settings_file, "r", encoding="utf8") as f:
+            json.load(f)
+    except (ValueError, OSError):
+        quarantined = settings_file + ".corrupt"
+        try:
+            os.replace(settings_file, quarantined)
+            print(
+                "[Ramses] Warning: the add-on settings file was corrupt and "
+                "has been moved to " + quarantined + ". Default settings "
+                "will be used; re-configure the add-on if needed."
+            )
+        except OSError:
+            pass
+
 def run_app():
     if not _acquire_instance_lock():
         return
+
+    # Move a corrupt settings file aside before the first `import ramses`
+    # (below, via syntheyes_host) triggers RamSettings to read it.
+    _quarantine_corrupt_addon_settings()
 
     # --- SyPy Setup ---
     print("Searching for SyPy3...")
