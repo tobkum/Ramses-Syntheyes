@@ -221,6 +221,11 @@ def run_app():
             # so we also refresh when a new shot is loaded into an unsaved scene.
             self._context_cache = {"filePath": None, "_pending_uuid": None, "item": None, "step": None}
 
+            # Daemon connectivity state — pipeline actions are gated on it, and it
+            # is re-checked periodically by the poll timer (see _refresh_daemon_state).
+            self._daemon_online = True
+            self._poll_tick = 0
+
             self.setWindowTitle("Ramses - SynthEyes")
             self.setStyleSheet(
                 "QMainWindow { background-color: #1a1a1a; }"
@@ -228,7 +233,16 @@ def run_app():
             )
 
             self.setup_ui()
+            # Establish the real daemon state before the first paint so buttons
+            # start in the correct enabled/disabled state (online() is patched to
+            # never raise).
+            try:
+                self._daemon_online = bool(ram.RamDaemonInterface.instance().online())
+            except Exception:
+                self._daemon_online = False
             self.refresh_context()
+            if not self._daemon_online:
+                self._set_status("⚠ Ramses is offline — pipeline actions paused.", "warn")
 
             # The panel is a separate process from SynthEyes, so nothing tells it
             # when the artist opens/switches a scene directly in SynthEyes. Poll
@@ -424,12 +438,17 @@ def run_app():
             line.setText(text)
 
         def _poll_refresh(self):
-            """Timer tick: refresh the header only when the .sni path changed.
+            """Timer tick: refresh the header when the .sni path changed, and
+            re-check daemon connectivity roughly every 6s.
 
-            Kept deliberately cheap — a single SNIFileName() read per tick — so
-            it can run continuously without hammering the daemon. A full refresh
-            (which re-reads status) happens on focus-in via changeEvent.
+            The path check is a single cheap SNIFileName() read per tick; the
+            daemon ping is throttled to every 4th tick so it doesn't hammer the
+            socket. A full refresh (which re-reads status) also happens on
+            focus-in via changeEvent.
             """
+            self._poll_tick += 1
+            if self._poll_tick % 4 == 0:
+                self._refresh_daemon_state()
             try:
                 path = self.host.currentFilePath()
             except Exception:
@@ -437,6 +456,25 @@ def run_app():
             if path != self._last_poll_path:
                 self._last_poll_path = path
                 self.refresh_context()
+
+        def _refresh_daemon_state(self):
+            """Re-check the Ramses daemon; on a state change, re-gate the buttons.
+
+            online() is patched to never raise, but the extra guard keeps a
+            listener/socket hiccup from bubbling out of the timer callback.
+            """
+            try:
+                online = bool(ram.RamDaemonInterface.instance().online())
+            except Exception:
+                online = False
+            if online == self._daemon_online:
+                return
+            self._daemon_online = online
+            self.refresh_context()  # re-gate buttons for the new state
+            if online:
+                self._set_status("✓ Reconnected to Ramses.", "ok")
+            else:
+                self._set_status("⚠ Ramses is offline — pipeline actions paused.", "warn")
 
         def changeEvent(self, event):
             """Refresh when the panel regains focus (picks up external edits)."""
@@ -534,14 +572,22 @@ def run_app():
                 else:
                     self.context_label.setText("<font color='#cc9900'>No Active Scene</font>")
 
-            # Buttons that require a pipeline context (known item + step)
+            online = self._daemon_online
+
+            # Buttons that require a pipeline context (known item + step) AND the
+            # daemon (they read/write the database).
             for btn in (self.btn_save, self.btn_incremental, self.btn_comment,
                         self.btn_retrieve, self.btn_sync, self.btn_preview,
                         self.btn_open_preview, self.btn_export, self.btn_status):
-                btn.setEnabled(in_pipeline)
+                btn.setEnabled(in_pipeline and online)
 
-            # Save As / Create is always available (used to enter the pipeline)
-            # Browse Shots, Check for Update, About are always available
+            # Buttons that need the daemon to browse/list, but not a current
+            # context: they enter the pipeline.
+            for btn in (self.btn_switch, self.btn_import, self.btn_save_as):
+                btn.setEnabled(online)
+
+            # Settings, Check for Update and About never need the daemon and stay
+            # enabled at all times.
 
         # --- Handlers ---
 
