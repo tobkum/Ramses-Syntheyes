@@ -1411,9 +1411,26 @@ class SynthEyesHost(RamHost):
         return publishOptions
 
     def _replace(self, filePaths: list, item: RamItem, step: RamStep, importOptions: list, forceShowImportUI: bool) -> bool:
+        """Deliberately unimplemented — see note below.
+
+        In Ramses-Fusion, Replace swaps a Loader's footage to a different
+        published version in place. The SynthEyes analog would be re-pointing
+        the current shot's footage to a different published plate version while
+        keeping the existing solve.
+
+        SynthEyes binds footage at shot-creation time (NewSceneAndShot /
+        AddShot) and exposes NO supported SyPy or Sizzle call to change the
+        image source of an existing shot; a blind write to the internal
+        'filenam' attribute would risk silently desyncing the RAM cache and
+        trackers from the new footage. Rather than ship a corrupting guess,
+        Replace is deferred until a safe footage-repoint path is available
+        (e.g. via Boris FX support). To move to a new plate today, create a new
+        scene from it via 'Browse Shots'.
+        """
         return False
 
     def _replaceUI(self, item: RamItem, step: RamStep) -> dict:
+        """Unused — Replace is deferred (see _replace for the reason)."""
         return None
 
     def _restoreVersionUI(self, versionFiles: list) -> str:
