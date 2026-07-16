@@ -3,10 +3,6 @@ import os
 import time
 import json
 import re
-try:
-    import ramses.yaml as yaml
-except ImportError:
-    import yaml
 from ramses import (
     RamHost,
     RamItem,
@@ -1277,66 +1273,81 @@ class SynthEyesHost(RamHost):
         if not showPublishUI:
             return options
 
-        # Convert dict to YAML for editing
-        try:
-            current_yaml = yaml.dump(options, default_flow_style=False)
-        except Exception:
-            current_yaml = ""
-
-        yaml_label = (
-            "exportType         — name from SynthEyes File › Export menu\n"
-            "previewFormat      — image seq: jpg png exr dpx tif  |  movie: avi mov mp4\n"
-            "previewRenderSettings    — advanced: SynthEyes channel string (empty = scene default)\n"
-            "previewRenderCompression — advanced: SynthEyes codec string   (empty = scene default)"
-        )
-
+        # A small form (replaces the old hand-edited-YAML editor). Editable
+        # combo boxes give discoverability while still allowing any value.
         try:
             try:
-                from PySide2 import QtWidgets as qw, QtGui as qg
+                from PySide2 import QtWidgets as qw
+                from PySide2 import QtCore as qc
             except ImportError:
-                from PySide6 import QtWidgets as qw, QtGui as qg
+                from PySide6 import QtWidgets as qw
+                from PySide6 import QtCore as qc
 
-            # Loop instead of recurse — each bad YAML submission re-shows the
-            # same dialog with the user's edits preserved, without stacking calls.
-            while True:
-                dialog = qw.QDialog()
-                dialog.setWindowTitle("Export Settings")
-                dialog.setMinimumWidth(520)
-                layout = qw.QVBoxLayout(dialog)
+            dialog = qw.QDialog()
+            dialog.setWindowTitle("Export Settings")
+            dialog.setMinimumWidth(460)
+            layout = qw.QVBoxLayout(dialog)
+            form = qw.QFormLayout()
+            layout.addLayout(form)
 
-                layout.addWidget(qw.QLabel("Settings (YAML):"))
-                layout.addWidget(qw.QLabel(yaml_label))
+            # Tracking-data export type — must match a File › Export menu entry.
+            export_combo = qw.QComboBox()
+            export_combo.setEditable(True)
+            for name in ("Fusion Composition", "Nuke (.nk)", "After Effects (.jsx)",
+                         "Maya (.ma)", "3DS Max (.ms)"):
+                export_combo.addItem(name)
+            export_combo.setEditText(str(options.get("exportType", "Fusion Composition")))
+            export_combo.setToolTip(
+                "Must match an entry in the SynthEyes File › Export menu exactly.")
+            form.addRow("Export type:", export_combo)
 
-                editor = qw.QPlainTextEdit()
-                editor.setFont(qg.QFont("Courier New", 9))
-                editor.setPlainText(current_yaml)
-                editor.setMinimumHeight(300)
-                layout.addWidget(editor)
+            # Preview output format (file extension).
+            preview_combo = qw.QComboBox()
+            preview_combo.setEditable(True)
+            for ext in ("jpg", "png", "exr", "dpx", "tif", "avi", "mov", "mp4"):
+                preview_combo.addItem(ext)
+            preview_combo.setEditText(str(options.get("previewFormat", "jpg")).lstrip("."))
+            preview_combo.setToolTip(
+                "Image sequence: jpg png exr dpx tif   |   movie: avi mov mp4")
+            form.addRow("Preview format:", preview_combo)
 
-                buttons = qw.QDialogButtonBox(
-                    qw.QDialogButtonBox.Ok | qw.QDialogButtonBox.Cancel
-                )
-                buttons.accepted.connect(dialog.accept)
-                buttons.rejected.connect(dialog.reject)
-                layout.addWidget(buttons)
+            # Advanced overrides — empty means "use the scene's current setting".
+            settings_edit = qw.QLineEdit(str(options.get("previewRenderSettings", "")))
+            settings_edit.setPlaceholderText("empty = use the scene's current channel setting")
+            settings_edit.setToolTip(
+                "Advanced: SynthEyes channel-selection string. Leave empty for the scene default.")
+            form.addRow("Render settings:", settings_edit)
 
-                dialog.raise_()
-                dialog.activateWindow()
-                accepted = self._exec_dialog(dialog)
+            compression_edit = qw.QLineEdit(str(options.get("previewRenderCompression", "")))
+            compression_edit.setPlaceholderText("empty = use the scene's current codec")
+            compression_edit.setToolTip(
+                "Advanced: SynthEyes codec string. Leave empty for the scene default.")
+            form.addRow("Render codec:", compression_edit)
 
-                if not accepted:
-                    return None  # User cancelled
+            buttons = qw.QDialogButtonBox(
+                qw.QDialogButtonBox.Ok | qw.QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
 
-                try:
-                    new_options = yaml.safe_load(editor.toPlainText())
-                    if isinstance(new_options, dict):
-                        return new_options
-                    self._log("Publish settings YAML must be a mapping.", LogLevel.Warning)
-                except Exception as e:
-                    self._log(f"Invalid YAML in publish settings: {e}", LogLevel.Warning)
+            dialog.setWindowFlags(dialog.windowFlags() | qc.Qt.WindowStaysOnTopHint)
+            dialog.raise_()
+            dialog.activateWindow()
+            if not self._exec_dialog(dialog):
+                return None  # User cancelled
 
-                # Invalid YAML — preserve the user's text and loop back
-                current_yaml = editor.toPlainText()
+            # Start from the merged options so any extra keys a step carries are
+            # preserved; override only the four fields the form exposes.
+            result = dict(options)
+            export_type = export_combo.currentText().strip()
+            if export_type:
+                result["exportType"] = export_type
+            preview_fmt = preview_combo.currentText().strip().lstrip(".")
+            if preview_fmt:
+                result["previewFormat"] = preview_fmt
+            result["previewRenderSettings"] = settings_edit.text().strip()
+            result["previewRenderCompression"] = compression_edit.text().strip()
+            return result
 
         except Exception as e:
             self._log(f"Could not show publish settings UI: {e}", LogLevel.Warning)
