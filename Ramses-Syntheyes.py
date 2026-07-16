@@ -229,6 +229,17 @@ def run_app():
             self.setup_ui()
             self.refresh_context()
 
+            # The panel is a separate process from SynthEyes, so nothing tells it
+            # when the artist opens/switches a scene directly in SynthEyes. Poll
+            # the current .sni path on a light timer and refresh only when it
+            # actually changes (see _poll_refresh). Focus-in does a full refresh
+            # too (changeEvent) to also pick up status edits made in the Client.
+            # refresh_context() above already seeded self._last_poll_path.
+            self._poll_timer = qc.QTimer(self)
+            self._poll_timer.setInterval(1500)
+            self._poll_timer.timeout.connect(self._poll_refresh)
+            self._poll_timer.start()
+
         def setup_ui(self):
             """Builds the vertical toolbar UI with icons."""
             central_widget = qw.QWidget()
@@ -288,6 +299,15 @@ def run_app():
 
             layout.addStretch()
 
+            # Inline status line — non-blocking feedback that replaces the modal
+            # popups. Coloured by kind via _set_status (ok/warn/error/info).
+            self.status_line = qw.QLabel("")
+            self.status_line.setWordWrap(True)
+            self.status_line.setStyleSheet(
+                "QLabel { color: #888888; font-size: 11px; padding: 2px 4px; }"
+            )
+            layout.addWidget(self.status_line)
+
             # Footer version label
             self.btn_about = qw.QPushButton("Ramses v" + self.host.version)
             self.btn_about.setFlat(True)
@@ -322,12 +342,61 @@ def run_app():
             btn.setStyleSheet(ss)
             return btn
 
+        _STATUS_COLORS = {
+            "ok": "#6ab04c",
+            "warn": "#e1b12c",
+            "error": "#eb4d4b",
+            "info": "#888888",
+        }
+
+        def _set_status(self, text: str, kind: str = "info") -> None:
+            """Shows a one-line, non-blocking status message under the buttons.
+
+            kind is one of ok / warn / error / info and selects the colour.
+            """
+            line = getattr(self, "status_line", None)
+            if line is None:
+                return
+            color = self._STATUS_COLORS.get(kind, self._STATUS_COLORS["info"])
+            line.setStyleSheet(
+                f"QLabel {{ color: {color}; font-size: 11px; padding: 2px 4px; }}"
+            )
+            line.setText(text)
+
+        def _poll_refresh(self):
+            """Timer tick: refresh the header only when the .sni path changed.
+
+            Kept deliberately cheap — a single SNIFileName() read per tick — so
+            it can run continuously without hammering the daemon. A full refresh
+            (which re-reads status) happens on focus-in via changeEvent.
+            """
+            try:
+                path = self.host.currentFilePath()
+            except Exception:
+                return  # listener hiccup — try again next tick
+            if path != self._last_poll_path:
+                self._last_poll_path = path
+                self.refresh_context()
+
+        def changeEvent(self, event):
+            """Refresh when the panel regains focus (picks up external edits)."""
+            try:
+                if event.type() == qc.QEvent.ActivationChange and self.isActiveWindow():
+                    # refresh_context() re-reads status and re-seeds the poll baseline.
+                    self.refresh_context()
+            except Exception:
+                pass
+            super(RamsesSyntheyesApp, self).changeEvent(event)
+
         def refresh_context(self):
             """Updates the context label and button states based on current file."""
             # Cache by (filePath, pending_uuid) — file path alone misses the case
             # where a new shot is loaded into an unsaved (path == "") scene, because
             # the path never changes even though the pending identity has.
             current_path = self.host.currentFilePath()
+            # Keep the poll baseline in sync so a refresh triggered here (by a
+            # handler or focus-in) doesn't make the next timer tick re-fire.
+            self._last_poll_path = current_path
             pending_uuid = None
             if not current_path:
                 pending = getattr(self.host, "_pending_new_shot_item", None)
@@ -419,26 +488,35 @@ def run_app():
             """Import published footage (image sequence or movie) from a previous step."""
             if self.host.importItem():
                 self.refresh_context()
+                self._set_status("✓ Imported footage into the scene.", "ok")
 
         def on_sync(self):
             """Manually sync scene settings."""
             if self.host.setupCurrentFile():
-                qw.QMessageBox.information(self, "Ramses", "Scene settings synced with database.")
+                self._set_status("✓ Scene settings synced (resolution, FPS, range).", "ok")
             else:
-                qw.QMessageBox.warning(self, "Ramses", "Could not sync scene settings.\nMake sure a Ramses shot is active.")
+                self._set_status("Could not sync — make sure a Ramses shot is active.", "warn")
 
         def on_preview(self):
             """Render and save a preview sequence (no .comp export)."""
             try:
-                self.host.savePreview()
+                # savePreview() returns False only when the scene isn't saved yet;
+                # None (falsy) is the normal success return.
+                if self.host.savePreview() is False:
+                    self._set_status("Save the scene before creating a preview.", "warn")
+                else:
+                    self._set_status(f"✓ Preview saved · {time.strftime('%H:%M')}", "ok")
             except Exception as e:
-                qw.QMessageBox.critical(self, "Preview Failed",
-                    f"Could not save preview:\n{e}")
+                self.host._log(f"Preview failed: {e}", ram.LogLevel.Critical)
+                self._set_status("Preview failed — see the SynthEyes console.", "error")
             self.refresh_context()
 
         def on_export(self):
             """Export tracking data via the Ramses publish lifecycle."""
-            self.host.publish(forceShowPublishUI=True)
+            if self.host.publish(forceShowPublishUI=True):
+                self._set_status(f"✓ Exported to pipeline · {time.strftime('%H:%M')}", "ok")
+            else:
+                self._set_status("Export did not complete — see the SynthEyes console.", "warn")
             self.refresh_context()
 
         def on_open(self):
@@ -446,24 +524,33 @@ def run_app():
                 self.refresh_context()
 
         def on_save(self):
-            self.host.save()
+            if self.host.save():
+                self._set_status(f"✓ Saved · {time.strftime('%H:%M')}", "ok")
+            else:
+                self._set_status("Save failed — see the SynthEyes console.", "error")
             self.refresh_context()
 
         def on_incremental(self):
-            self.host.save(incremental=True)
+            if self.host.save(incremental=True):
+                self._set_status(f"✓ Saved new version · {time.strftime('%H:%M')}", "ok")
+            else:
+                self._set_status("Save failed — see the SynthEyes console.", "error")
             self.refresh_context()
 
         def on_retrieve(self):
             if self.host.restoreVersion():
                 self.refresh_context()
+                self._set_status("✓ Version restored.", "ok")
 
         def on_save_as(self):
             if self.host.saveAs():
                 self.refresh_context()
+                self._set_status("✓ Saved into the pipeline.", "ok")
 
         def on_switch_shot(self):
             if self.host.open():
                 self.refresh_context()
+                self._set_status("✓ Shot loaded.", "ok")
 
         def on_status(self):
             if self.host.updateStatus():
@@ -474,6 +561,7 @@ def run_app():
                     ram.RamDaemonInterface.instance()._cache.pop('data', None)
                 except AttributeError:
                     pass  # SDK version without this internal cache — no-op
+                self._set_status("✓ Status updated.", "ok")
             self.refresh_context()
 
         def on_check_update(self):
