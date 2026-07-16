@@ -199,6 +199,27 @@ class SynthEyesHost(RamHost):
         except Exception:
             return ""
 
+    def resolvePreviewPath(self) -> str:
+        """Returns the most recent preview file for the current shot, or "".
+
+        Used by the panel's 'Open Preview' button. Reads the shot's preview
+        folder (read-only — no mkdir) and returns the newest media file in it,
+        which is the preview the artist most recently rendered.
+        """
+        with DisableMakedirs():
+            folder = self.previewPath()
+        if not folder or not os.path.isdir(folder):
+            return ""
+        candidates = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if os.path.splitext(f)[1].lower() in _FOOTAGE_EXTENSIONS
+            and os.path.isfile(os.path.join(folder, f))
+        ]
+        if not candidates:
+            return ""
+        return self.normalizePath(max(candidates, key=os.path.getmtime))
+
     def _isDirty(self) -> bool:
         """Checks if the current scene has unsaved changes."""
         if not self.hlev:

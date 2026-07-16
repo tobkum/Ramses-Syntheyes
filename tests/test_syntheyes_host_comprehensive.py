@@ -579,5 +579,51 @@ class TestSaveChangesUI(unittest.TestCase):
         self.assertEqual(result, "cancel")
 
 
+# ---------------------------------------------------------------------------
+# resolvePreviewPath: newest preview file, read-only
+# ---------------------------------------------------------------------------
+
+class TestResolvePreviewPath(unittest.TestCase):
+
+    def setUp(self):
+        self.host, _ = _make_host()
+
+    def test_empty_when_no_folder(self):
+        with patch.object(self.host, "previewPath", return_value=""):
+            self.assertEqual(self.host.resolvePreviewPath(), "")
+
+    def test_empty_when_folder_missing(self):
+        with patch.object(self.host, "previewPath",
+                          return_value="/no/such/preview/folder"):
+            self.assertEqual(self.host.resolvePreviewPath(), "")
+
+    def test_returns_newest_media_file(self):
+        import tempfile
+        folder = tempfile.mkdtemp()
+        old = os.path.join(folder, "shot_preview.0001.jpg")
+        new = os.path.join(folder, "shot_preview.0002.jpg")
+        # A non-media sidecar that must be ignored even though it may be newest.
+        sidecar = os.path.join(folder, "_ramses_data.json")
+        for p in (old, new, sidecar):
+            with open(p, "w") as f:
+                f.write("x")
+        # Force deterministic mtimes: old < new, sidecar newest of all.
+        os.utime(old, (1000, 1000))
+        os.utime(new, (2000, 2000))
+        os.utime(sidecar, (3000, 3000))
+        with patch.object(self.host, "previewPath", return_value=folder):
+            result = self.host.resolvePreviewPath()
+        # Newest *media* file wins; the newer sidecar is filtered out.
+        self.assertEqual(os.path.normpath(result), os.path.normpath(new))
+
+    def test_empty_when_only_sidecars(self):
+        import tempfile
+        folder = tempfile.mkdtemp()
+        with open(os.path.join(folder, "_ramses_data.json"), "w") as f:
+            f.write("{}")
+        with patch.object(self.host, "previewPath", return_value=folder):
+            self.assertEqual(self.host.resolvePreviewPath(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

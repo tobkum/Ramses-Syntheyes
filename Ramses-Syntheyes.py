@@ -312,6 +312,10 @@ def run_app():
                 "Save Preview", "rampreview.png", self.on_preview, PUBLISH_HUE,
                 tooltip="Render the tracking overlay to the shot's _preview folder for supervisor review.")
             layout.addWidget(self.btn_preview)
+            self.btn_open_preview = self.create_button(
+                "Open Preview", "ramopen.png", self.on_open_preview, PUBLISH_HUE,
+                tooltip="Open the most recent preview for this shot in your default viewer.")
+            layout.addWidget(self.btn_open_preview)
             self.btn_export = self.create_button(
                 "Export to Pipeline", "rampublishsettings.png", self.on_export, PUBLISH_ACCENT,
                 tooltip="Export the tracking data (Fusion comp by default) to the step's _published folder, where Ramses-Fusion picks it up.",
@@ -523,7 +527,8 @@ def run_app():
 
             # Buttons that require a pipeline context (known item + step)
             for btn in (self.btn_save, self.btn_incremental, self.btn_retrieve,
-                        self.btn_sync, self.btn_preview, self.btn_export, self.btn_status):
+                        self.btn_sync, self.btn_preview, self.btn_open_preview,
+                        self.btn_export, self.btn_status):
                 btn.setEnabled(in_pipeline)
 
             # Save As / Create is always available (used to enter the pipeline)
@@ -557,6 +562,21 @@ def run_app():
                 self.host._log(f"Preview failed: {e}", ram.LogLevel.Critical)
                 self._set_status("Preview failed — see the SynthEyes console.", "error")
             self.refresh_context()
+
+        def on_open_preview(self):
+            """Open the most recent preview for this shot in the default viewer."""
+            try:
+                preview_path = self.host.resolvePreviewPath()
+            except Exception as e:
+                self.host._log(f"Could not resolve preview path: {e}", ram.LogLevel.Critical)
+                self._set_status("Could not resolve the preview path.", "error")
+                return
+            if not preview_path or not os.path.exists(preview_path):
+                self._set_status("No preview yet — use Save Preview first.", "warn")
+                return
+            # QDesktopServices picks the OS default handler for the file type.
+            qg.QDesktopServices.openUrl(qc.QUrl.fromLocalFile(preview_path))
+            self._set_status("Opened preview in the default viewer.", "ok")
 
         def on_export(self):
             """Export tracking data via the Ramses publish lifecycle."""
