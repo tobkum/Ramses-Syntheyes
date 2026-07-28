@@ -24,6 +24,20 @@
 #======================= END GPL LICENSE BLOCK ========================
 
 import os
+import re
+
+# LOCAL PATCH (not upstream): trailing frame token of a sequence file, e.g.
+# "PLATE.01599116.exr" or "PLATE_0001.exr" -> group(1) == the frame number.
+# The separator must directly precede the digits so version tokens like
+# "_v001" never match.
+#
+# Needed because RamFileInfo cannot separate a frame number from the
+# extension: the Ramses naming regex ends in (?:\.([a-z0-9.]+))?$ and that
+# character class deliberately allows dots, so "PLATE.0001.exr" parses with
+# extension "0001.exr". That is by design (Ramses names have no frame
+# component), so the sequence detection below works on the file name instead
+# of trusting RamFileInfo.
+_FRAME_TOKEN_RE = re.compile(r"[._](\d+)\.[A-Za-z0-9]{1,5}$")
 
 try:
     from PySide2 import QtWidgets as qw
@@ -299,6 +313,13 @@ class RamImportDialog(RamDialog):
         # List available files
         folder = self.versionBox.currentData()
         files = RamFileManager.getRamsesFiles( folder )
+
+        # Rows are collected first so image sequences can be collapsed (see
+        # below) before anything is added to the widget. Order of first
+        # appearance is preserved.
+        rows = []
+        seqRows = {}
+
         for f in files:
             nm = RamFileInfo()
             fileName = os.path.basename(f)
@@ -312,13 +333,65 @@ class RamImportDialog(RamDialog):
             if len(self.__hideExtensions) > 0 and nm.extension in self.__hideExtensions:
                 continue
             
-            # Main files have empty resource strings. 
+            # Main files have empty resource strings.
             # We display them as "Main" to be consistent with the Ramses UI.
             title = resource if resource != "" else "Main"
-            title = title + " (" + nm.extension + ")"
-            item = qw.QListWidgetItem( title )
-            item.setData(qc.Qt.UserRole, f)
-            item.setToolTip(fileName)
+
+            # LOCAL PATCH (not upstream): collapse image sequences.
+            # A published sequence is one file per frame, so this list used to
+            # show one row per frame - hundreds of near-identical entries with
+            # only the frame number (parsed as part of the extension) telling
+            # them apart. Group them into a single row.
+            #
+            # The row carries the LOWEST frame as its path, which is what the
+            # hosts want: SynthEyesHost._pick_footage_file() sorts and takes
+            # the first anyway, and both SynthEyes and Fusion expand a whole
+            # sequence from any single frame. So this is presentation only -
+            # the import result is unchanged.
+            seqMatch = _FRAME_TOKEN_RE.search(fileName)
+            if seqMatch is None:
+                rows.append({
+                    "label": title + " (" + nm.extension + ")",
+                    "path": f,
+                    "tooltip": fileName,
+                })
+                continue
+
+            frame = int(seqMatch.group(1))
+            seqExt = fileName[seqMatch.end(1) + 1:]
+            # Same sequence = same resource, same stem, same real extension.
+            key = (
+                title,
+                fileName[:seqMatch.start(1)].lower(),
+                seqExt.lower(),
+            )
+
+            slot = seqRows.get(key)
+            if slot is None:
+                seqRows[key] = len(rows)
+                rows.append({
+                    "label": title + " ([####]." + seqExt + ")",
+                    "path": f,
+                    "tooltip": fileName,
+                    "frame": frame,
+                    "count": 1,
+                })
+                continue
+
+            row = rows[slot]
+            row["count"] += 1
+            if frame < row["frame"]:
+                row["frame"] = frame
+                row["path"] = f
+                row["tooltip"] = fileName
+
+        for row in rows:
+            label = row["label"]
+            if row.get("count", 1) > 1:
+                label = label + " - %i frames" % row["count"]
+            item = qw.QListWidgetItem( label )
+            item.setData(qc.Qt.UserRole, row["path"])
+            item.setToolTip(row["tooltip"])
             self.versionList.addItem(item)
 
     def setSingleSelection(self, single:bool=True):
