@@ -184,3 +184,42 @@ class TestPlateDiscovery(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSavePreviewContract(unittest.TestCase):
+    """savePreview() must return a real bool its caller can test.
+
+    The vendored base returns False when the preview path is unresolvable but
+    None both on success AND when _preview() produced no files, so a failed or
+    cancelled render was indistinguishable from a good one. The UI used to work
+    around that with `is False`, which only ever caught the unsaved-scene case.
+    """
+
+    def setUp(self):
+        self.mock_hlev = MagicMock()
+        self.host = SynthEyesHost(self.mock_hlev)
+
+    def test_unresolvable_preview_path_is_false(self):
+        self.host.previewPath = MagicMock(return_value="")
+        self.assertIs(self.host.savePreview(), False)
+
+    def test_render_producing_no_files_is_false(self):
+        """The case the old `is False` check reported as success."""
+        self.host.previewPath = MagicMock(return_value="X:/proj/_preview")
+        self.host.currentFilePath = MagicMock(
+            return_value="X:/proj/SHOTS/SH010/TRACK/TEST_S_SH010_TRACK.sni"
+        )
+        with patch.object(self.host, "_preview", return_value=[]):
+            self.assertIs(self.host.savePreview(), False)
+
+    def test_files_written_is_true(self):
+        self.host.previewPath = MagicMock(return_value="X:/proj/_preview")
+        self.host.currentFilePath = MagicMock(
+            return_value="X:/proj/SHOTS/SH010/TRACK/TEST_S_SH010_TRACK.sni"
+        )
+        self.host.currentVersion = MagicMock(return_value=3)
+        self.host.currentVersionFilePath = MagicMock(return_value="X:/v003.sni")
+        with patch.object(
+            self.host, "_preview", return_value=["X:/proj/_preview/SH010.0001.jpg"]
+        ), patch("syntheyes_host.RamMetaDataManager"):
+            self.assertIs(self.host.savePreview(), True)

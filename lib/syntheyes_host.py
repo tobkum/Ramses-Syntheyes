@@ -1265,6 +1265,49 @@ class SynthEyesHost(RamHost):
             for f in (after - before)
         )
 
+    def savePreview(self) -> bool:
+        """Renders the preview and reports whether a file was actually written.
+
+        The vendored base returns False when the preview path cannot be
+        resolved, but returns None on the success path *and* whenever
+        _preview() produced no files at all. So a render that failed or was
+        cancelled is indistinguishable from a successful one, and a caller
+        checking `is False` only ever catches the unsaved-scene case.
+
+        This override keeps the same behaviour and returns a real bool, so the
+        UI can tell the artist the truth.
+
+        Returns:
+            bool: True when at least one preview file was produced.
+        """
+        path = self.previewPath()
+        if not path:
+            self.log(
+                "The current scene is not saved, so there is nowhere to put "
+                "the preview.",
+                LogLevel.Critical,
+            )
+            return False
+
+        fileInfo = RamFileInfo()
+        fileInfo.setFilePath(self.currentFilePath())
+        previewInfo = fileInfo.copy()
+        previewInfo.version = -1
+        previewInfo.extension = ""
+        previewInfo.resource = ""
+        previewInfo.state = ""
+
+        previewFiles = self._preview(
+            path, previewInfo.fileName(), self.currentItem(), self.currentStep()
+        )
+        if not previewFiles:
+            return False
+
+        for file in previewFiles:
+            RamMetaDataManager.setVersion(file, self.currentVersion())
+            RamMetaDataManager.setVersionFilePath(file, self.currentVersionFilePath())
+        return True
+
     def _publish(self, publishInfo: RamFileInfo, publishOptions: dict) -> list:
         """Exports tracking data to the publish folder using SynthEyes Export."""
         if not self.hlev:

@@ -68,6 +68,17 @@ def _patch_metadata_manager():
     """
     from ramses.metadata_manager import RamMetaDataManager
 
+    # getValue/setValue wrap whatever is currently installed, so a second
+    # apply() would wrap the wrapper: every metadata read would then run
+    # through one more nested frame, and the previous closures would leak.
+    # SynthEyes runs the plugin in a fresh interpreter, so apply() happens
+    # once and this is defensive rather than load-bearing - unlike
+    # Ramses-Fusion, whose entry script reloads its host module on every
+    # launch and did stack wrappers one layer per launch until this guard
+    # was added there.
+    if getattr(RamMetaDataManager, "_ramses_patched", False):
+        return
+
     def _patched_getMetaData(folderPath):
         """Reads the sidecar without pruning entries for missing files."""
         file = RamMetaDataManager.getMetaDataFile(folderPath)
@@ -127,6 +138,7 @@ def _patch_metadata_manager():
     RamMetaDataManager.setFileMetaData = staticmethod(_patched_setFileMetaData)
     RamMetaDataManager.getValue = staticmethod(_patched_getValue)
     RamMetaDataManager.setValue = staticmethod(_patched_setValue)
+    RamMetaDataManager._ramses_patched = True
 
 
 def _patch_daemon_interface():
@@ -140,6 +152,11 @@ def _patch_daemon_interface():
     """
     from ramses.daemon_interface import RamDaemonInterface
 
+    # Same re-entrancy hazard as the metadata patches: this wraps the current
+    # online(), so a second apply() would wrap the wrapper.
+    if getattr(RamDaemonInterface, "_ramses_patched", False):
+        return
+
     _original_online = RamDaemonInterface.online
 
     def _patched_online(self):
@@ -150,6 +167,7 @@ def _patch_daemon_interface():
             return False
 
     RamDaemonInterface.online = _patched_online
+    RamDaemonInterface._ramses_patched = True
 
 
 def apply():

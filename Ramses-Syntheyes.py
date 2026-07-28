@@ -612,12 +612,19 @@ def run_app():
         def on_preview(self):
             """Render and save a preview sequence (no .comp export)."""
             try:
-                # savePreview() returns False only when the scene isn't saved yet;
-                # None (falsy) is the normal success return.
-                if self.host.savePreview() is False:
-                    self._set_status("Save the scene before creating a preview.", "warn")
-                else:
+                # SyntheyesHost.savePreview() returns a real bool: True only
+                # when a file was actually written. The `is False` dance this
+                # used to do was a workaround for the vendored base returning
+                # None on success, which also made a failed or cancelled
+                # render read as a success.
+                if self.host.savePreview():
                     self._set_status(f"✓ Preview saved · {time.strftime('%H:%M')}", "ok")
+                else:
+                    self._set_status(
+                        "Preview was not created. Save the scene first, and "
+                        "check the SynthEyes console for render errors.",
+                        "warn",
+                    )
             except Exception as e:
                 self.host._log(f"Preview failed: {e}", ram.LogLevel.Critical)
                 self._set_status("Preview failed — see the SynthEyes console.", "error")
