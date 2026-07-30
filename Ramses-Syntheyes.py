@@ -72,14 +72,11 @@ def _release_instance_lock():
     except OSError:
         pass
 
-def _quarantine_corrupt_addon_settings():
-    """Moves a corrupt add-on settings file aside so startup can't hard-crash.
+def _addon_settings_path() -> str:
+    """Path to the shared add-on settings file, or "" on an unsupported OS.
 
-    RamSettings loads ${APPDATA}/Ramses/Config/ramses_addons_settings.json on
-    the first `import ramses`; a truncated or malformed JSON there would raise
-    deep in the SDK before the UI ever appears. Rename it to *.corrupt and let
-    the SDK fall back to defaults. Only the platforms the SDK itself handles
-    (Windows, Linux) are covered — it doesn't define a Darwin config path.
+    Only the platforms the SDK itself handles (Windows, Linux) are covered —
+    it doesn't define a Darwin config path.
     """
     import platform as _platform
     system = _platform.system()
@@ -88,9 +85,76 @@ def _quarantine_corrupt_addon_settings():
     elif system == "Linux":
         folder = os.path.expanduser("~/.config/Ramses/Config")
     else:
-        return
-    settings_file = os.path.join(folder, "ramses_addons_settings.json")
+        return ""
+    return os.path.join(folder, "ramses_addons_settings.json")
+
+
+def _should_hide_console(settings_file: str) -> bool:
+    """Whether to hide the console window, read straight from the settings JSON.
+
+    Deliberately does not go through RamSettings: this has to be decided
+    before `import ramses`, because the whole point is to hide the window
+    before the startup prints flash it onto the screen.
+
+    Fails *open* — a settings file that exists but cannot be parsed is exactly
+    the situation where the artist needs to see the output, so leave the
+    console visible. An absent file is just a first run and takes the normal
+    default (debugLog off, so hide).
+    """
+    if not settings_file:
+        return False
     if not os.path.isfile(settings_file):
+        return True     # no settings yet: debugLog defaults to off
+    try:
+        with open(settings_file, "r", encoding="utf8") as f:
+            data = json.load(f)
+    except (ValueError, OSError):
+        return False    # unreadable settings: keep the diagnostics visible
+    if not isinstance(data, dict):
+        return False
+    # A missing key is not corruption: an artist who never touched the setting
+    # has no "debugLog" entry, and that is the ordinary hide-the-console case.
+    user = data.get("userSettings", {})
+    if not isinstance(user, dict):
+        return False
+    return not user.get("debugLog", False)
+
+
+def _set_console_visible(visible: bool):
+    """Shows or hides the Windows console window this script was launched with.
+
+    SynthEyes runs the plugin with python.exe, which allocates a console the
+    artist otherwise has to minimise on every start. Hiding the *window* keeps
+    sys.stdout a real handle, so every print() and _log() still works and
+    anything reading the stream still receives it. Pointing SynthEyes at
+    pythonw.exe instead would also remove the window, but it sets sys.stdout
+    to None and the output is lost outright.
+
+    No-op off Windows, and when the process has no console of its own.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if not hwnd:
+            return
+        SW_HIDE, SW_SHOW = 0, 5
+        ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW if visible else SW_HIDE)
+    except Exception:
+        pass    # cosmetic only — never let this stop the plugin from starting
+
+
+def _quarantine_corrupt_addon_settings():
+    """Moves a corrupt add-on settings file aside so startup can't hard-crash.
+
+    RamSettings loads ${APPDATA}/Ramses/Config/ramses_addons_settings.json on
+    the first `import ramses`; a truncated or malformed JSON there would raise
+    deep in the SDK before the UI ever appears. Rename it to *.corrupt and let
+    the SDK fall back to defaults.
+    """
+    settings_file = _addon_settings_path()
+    if not settings_file or not os.path.isfile(settings_file):
         return
     try:
         with open(settings_file, "r", encoding="utf8") as f:
@@ -108,6 +172,11 @@ def _quarantine_corrupt_addon_settings():
             pass
 
 def run_app():
+    # First thing, before any print: otherwise the console flashes on screen
+    # before it is hidden. Kept visible when debugLog is on.
+    if _should_hide_console(_addon_settings_path()):
+        _set_console_visible(False)
+
     if not _acquire_instance_lock():
         return
 
@@ -780,6 +849,9 @@ def run_app():
 
             debug_check = qw.QCheckBox("Verbose debug logging to the console")
             debug_check.setChecked(bool(us.get("debugLog", False)))
+            debug_check.setToolTip(
+                "Also keeps the console window visible on startup, which is "
+                "otherwise hidden. Takes effect the next time the plugin starts.")
             form.addRow("Diagnostics:", debug_check)
 
             buttons = qw.QDialogButtonBox(
@@ -854,6 +926,10 @@ if __name__ == "__main__":
     try:
         run_app()
     except Exception:
+        # Bring the console back before reporting. run_app() may have hidden
+        # it, and the input() below would then block forever on a window the
+        # artist cannot see or reach — a hang with no visible cause.
+        _set_console_visible(True)
         print("\n" + "!"*60)
         print("RAMSES PLUGIN FATAL ERROR:")
         traceback.print_exc()
