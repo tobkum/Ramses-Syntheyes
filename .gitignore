@@ -32,3 +32,6 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+
+# Output of tools/probe_frame_range.py
+tools/probe_frame_range_report.txt

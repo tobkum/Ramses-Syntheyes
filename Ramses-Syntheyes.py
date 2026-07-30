@@ -772,11 +772,11 @@ def run_app():
                 "creating a new scene. Comma-separated; case-insensitive.")
             form.addRow("Plate step names:", plate_edit)
 
-            start_spin = qw.QSpinBox()
-            start_spin.setRange(0, 1000000)
-            start_spin.setValue(int(us.get("compStartFrame", 1001)))
-            start_spin.setToolTip("First frame number applied to the scene's frame range.")
-            form.addRow("Start frame:", start_spin)
+            # NOTE: no "Start frame" field here on purpose. compStartFrame is a
+            # Fusion comp convention; a SynthEyes shot is numbered from its own
+            # shot.start and the playback range follows the plate. The setting
+            # still lives in the shared settings file because Ramses-Fusion
+            # owns it — this dialog just must not offer it.
 
             debug_check = qw.QCheckBox("Verbose debug logging to the console")
             debug_check.setChecked(bool(us.get("debugLog", False)))
@@ -799,7 +799,6 @@ def run_app():
             names = [n.strip() for n in plate_edit.text().split(",") if n.strip()]
             if names:
                 us["plateStepNames"] = names
-            us["compStartFrame"] = int(start_spin.value())
             us["debugLog"] = bool(debug_check.isChecked())
             try:
                 self.settings.save()

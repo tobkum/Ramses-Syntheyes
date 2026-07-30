@@ -323,13 +323,211 @@ class TestSetupCurrentFile(unittest.TestCase):
         self.host._setupCurrentFile(MagicMock(), MagicMock(), opts)
         self.hlev.BeginShotChanges.assert_not_called()
 
-    def test_smart_frame_range_trusts_syntheyes_over_ramses_movie(self):
-        """If Ramses says 1 frame (movie placeholder) but SynthEyes has more, use SE."""
-        self.shot.frames = 250
+    def test_save_path_does_not_touch_the_play_range(self):
+        """syncRange defaults to False so a plain save leaves the range alone."""
+        self.shot.Get.side_effect = _shot_get()
         self.host._setupCurrentFile(MagicMock(), MagicMock(),
-                                    {"frames": 1, "framerate": 24.0})
-        # AnimEnd = compStartFrame(1001) + 250 - 1 = 1250
-        self.hlev.SetAnimEnd.assert_called_with(1250)
+                                    {"frames": 100, "framerate": 24.0})
+        self.hlev.SetAnimStart.assert_not_called()
+        self.hlev.SetAnimEnd.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Playback range: it follows the PLATE, not the Ramses duration
+#
+# SynthEyes numbers a shot internally from shot.start and requires the play
+# range to stay inside the active shot (Sizzle reference, Scene.playStart).
+# The old code built the range from `compStartFrame` (1001), a Fusion comp
+# convention, so it always asked for a range outside the shot and SynthEyes
+# discarded it. These tests pin the corrected behaviour.
+# ---------------------------------------------------------------------------
+
+def _shot_get(**overrides):
+    """Builds a shot.Get side_effect. An Exception value is raised, not returned."""
+    values = {
+        "start": 0, "stop": 99, "actualLength": 100, "frameCount": 100,
+        "width": 1920, "height": 1080, "pixelAspect": 1.0,
+    }
+    values.update(overrides)
+
+    def get(key):
+        v = values.get(key)
+        if isinstance(v, Exception):
+            raise v
+        return v
+
+    return get
+
+
+_MATCHING_OPTS = {
+    "framerate": 24.0, "width": 1920, "height": 1080, "pixelAspectRatio": 1.0,
+}
+
+
+class TestPlayRangeSync(unittest.TestCase):
+
+    def setUp(self):
+        self.host, self.hlev = _make_host()
+        self.shot = MagicMock()
+        self.shot.rate = 24.0
+        self.shot.Get.side_effect = _shot_get()
+        self.hlev.Shots.return_value = [self.shot]
+        # Real ints: _setPlayRange compares against AnimEnd() and reads back.
+        self.hlev.AnimStart.return_value = 0
+        self.hlev.AnimEnd.return_value = 99
+        self.hlev.Frame.return_value = 0
+
+    def _sync(self, opts=None, **kw):
+        o = dict(_MATCHING_OPTS)
+        o.update(opts or {})
+        return self.host._setupCurrentFile(MagicMock(), MagicMock(), o,
+                                           syncRange=True, **kw)
+
+    def _range_calls(self):
+        """The SetAnimStart/SetAnimEnd calls, in the order they were made."""
+        return [(c[0], c[1]) for c in self.hlev.method_calls
+                if c[0] in ("SetAnimStart", "SetAnimEnd")]
+
+    def test_range_comes_from_the_shot(self):
+        self._sync()
+        self.hlev.SetAnimStart.assert_called_with(0)
+        self.hlev.SetAnimEnd.assert_called_with(99)
+
+    def test_length_is_synced_before_the_range(self):
+        """The range is derived from the shot, so the shot's length must be
+        correct first. Order matters, not just that both happen."""
+        order = []
+        with patch.object(self.host, "_syncShotLength",
+                          side_effect=lambda s: order.append("length")), \
+             patch.object(self.host, "_syncPlayRange",
+                          side_effect=lambda *a, **k: order.append("range")):
+            self._sync()
+        self.assertEqual(order, ["length", "range"])
+
+    def test_comp_start_frame_is_never_used(self):
+        """1001 is a Fusion comp convention and must not reach SynthEyes."""
+        ramses.RAM_SETTINGS.userSettings = {"compStartFrame": 1001}
+        # A frame count must be present, or a 1001-based implementation would
+        # bail out before writing anything and the test would pass vacuously.
+        self._sync({"frames": 100})
+        calls = self._range_calls()
+        self.assertTrue(calls, "the range should have been written")
+        for name, args in calls:
+            self.assertNotIn(1001, args, f"{name} got the Fusion comp start frame")
+            self.assertNotIn(1100, args, f"{name} got a 1001-based end frame")
+
+    def test_end_is_written_first_when_the_range_moves_up(self):
+        """playStart must stay below playEnd, so moving up needs End first."""
+        self.hlev.AnimEnd.return_value = 99
+        self.shot.Get.side_effect = _shot_get(start=1001, stop=1100)
+        self.hlev.AnimStart.return_value = 1001   # read-back
+        self.hlev.AnimEnd.side_effect = [99, 1100, 1100]
+        self._sync()
+        self.assertEqual([n for n, _ in self._range_calls()],
+                         ["SetAnimEnd", "SetAnimStart"])
+
+    def test_start_is_written_first_when_the_range_moves_down(self):
+        self.hlev.AnimEnd.return_value = 5000
+        self.shot.Get.side_effect = _shot_get(start=0, stop=99)
+        self._sync()
+        self.assertEqual([n for n, _ in self._range_calls()],
+                         ["SetAnimStart", "SetAnimEnd"])
+
+    def test_clamping_is_reported_not_swallowed(self):
+        """SynthEyes clamping the range must produce a warning, not silence."""
+        self.hlev.AnimStart.return_value = 0
+        self.hlev.AnimEnd.return_value = 42     # asked for 99, got 42
+        with patch.object(self.host, "_log") as log:
+            self.assertFalse(self.host._setPlayRange(0, 99))
+        warned = [c for c in log.call_args_list if c[0][1] == LogLevel.Warning]
+        self.assertTrue(warned, "a clamped range must be logged as a warning")
+        self.assertIn("clamped", warned[0][0][0])
+
+    def test_ramses_duration_is_only_a_fallback(self):
+        """When the shot cannot answer, fall back to duration but keep base 0."""
+        self.shot.Get.side_effect = _shot_get(start=Exception("no such attr"))
+        self.hlev.AnimStart.return_value = 0
+        self.hlev.AnimEnd.return_value = 249
+        self._sync({"frames": 250})
+        self.hlev.SetAnimStart.assert_called_with(0)
+        self.hlev.SetAnimEnd.assert_called_with(249)
+
+    def test_no_write_when_neither_the_shot_nor_ramses_knows(self):
+        self.shot.Get.side_effect = _shot_get(start=Exception("nope"))
+        self._sync({"frames": 0, "duration": 0})
+        self.hlev.SetAnimStart.assert_not_called()
+        self.hlev.SetAnimEnd.assert_not_called()
+
+    def test_range_is_not_offset_by_the_plate_frame_numbers(self):
+        """The play range is in internal frames; matchFrameNumbers is display only."""
+        self.shot.Get.side_effect = _shot_get(frameFirstOffset=1599116)
+        self._sync()
+        self.hlev.SetAnimStart.assert_called_with(0)
+        self.hlev.SetAnimEnd.assert_called_with(99)
+
+    def test_current_frame_only_moved_when_outside_the_range(self):
+        self.hlev.Frame.return_value = 50
+        self._sync(forceUI=True)
+        self.hlev.SetFrame.assert_not_called()
+
+    def test_current_frame_pulled_into_the_range(self):
+        self.hlev.Frame.return_value = 5000
+        self._sync(forceUI=True)
+        self.hlev.SetFrame.assert_called_with(0)
+
+
+# ---------------------------------------------------------------------------
+# Shot length: frameCount must follow actualLength
+# ---------------------------------------------------------------------------
+
+class TestShotLengthSync(unittest.TestCase):
+
+    def setUp(self):
+        self.host, self.hlev = _make_host()
+        self.shot = MagicMock()
+
+    def test_frame_count_set_from_actual_length(self):
+        """The reference: "be sure to set this, based on actualLength"."""
+        self.shot.Get.side_effect = _shot_get(actualLength=100, frameCount=0)
+        self.assertTrue(self.host._syncShotLength(self.shot))
+        self.hlev.BeginShotChanges.assert_called_with(self.shot)
+        self.shot.Set.assert_called_with("frameCount", 100)
+        self.shot.Validate.assert_called_once()
+        self.hlev.AcceptShotChanges.assert_called_once()
+
+    def test_no_cache_invalidation_when_the_length_already_agrees(self):
+        self.shot.Get.side_effect = _shot_get(actualLength=100, frameCount=100)
+        self.assertTrue(self.host._syncShotLength(self.shot))
+        self.hlev.BeginShotChanges.assert_not_called()
+        self.shot.Set.assert_not_called()
+
+    def test_unreadable_length_is_left_alone(self):
+        self.shot.Get.side_effect = _shot_get(actualLength=0)
+        self.assertFalse(self.host._syncShotLength(self.shot))
+        self.hlev.BeginShotChanges.assert_not_called()
+
+    def test_failure_cancels_the_undo_block(self):
+        self.shot.Get.side_effect = _shot_get(actualLength=100, frameCount=0)
+        self.shot.Set.side_effect = Exception("boom")
+        self.assertFalse(self.host._syncShotLength(self.shot))
+        self.hlev.Cancel.assert_called_once()
+        self.hlev.AcceptShotChanges.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# save() must not overwrite a range the artist trimmed
+# ---------------------------------------------------------------------------
+
+class TestSaveDoesNotResyncRange(unittest.TestCase):
+
+    def test_save_passes_sync_range_false(self):
+        host, hlev = _make_host()
+        hlev.Version.return_value = "2026"
+        with patch.object(host, "setupCurrentFile") as setup, \
+             patch.object(host, "saveFilePath", return_value="X:/proj/f.sni"), \
+             patch.object(host, "_RamHost__save", return_value=True):
+            host.save()
+        setup.assert_called_once_with(forceUI=False, syncRange=False)
 
 
 # ---------------------------------------------------------------------------

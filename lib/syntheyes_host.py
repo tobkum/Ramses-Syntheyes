@@ -431,14 +431,23 @@ class SynthEyesHost(RamHost):
 
         return settings
 
-    def setupCurrentFile(self, forceUI: bool = True) -> bool:
-        """Applies Ramses settings to the current scene. Returns True on success."""
+    def setupCurrentFile(self, forceUI: bool = True, syncRange: bool = True) -> bool:
+        """Applies Ramses settings to the current scene. Returns True on success.
+
+        Args:
+            syncRange: Re-align the playback range with the shot. True for the
+                explicit "sync scene settings" action; save() passes False so
+                that saving never discards a range the artist trimmed by hand.
+        """
         if not self._ensure_connected():
             return False
         item = self.currentItem()
         if item:
             settings = self.collectItemSettings(item)
-            return self._setupCurrentFile(item, self.currentStep(), settings, forceUI=forceUI)
+            return self._setupCurrentFile(
+                item, self.currentStep(), settings,
+                forceUI=forceUI, syncRange=syncRange,
+            )
         return False
 
     def save(
@@ -452,8 +461,10 @@ class SynthEyesHost(RamHost):
         if not self._ensure_connected():
             return False
         if setupFile:
-            # When saving, do not force disruptive UI switches
-            self.setupCurrentFile(forceUI=False)
+            # When saving, do not force disruptive UI switches, and do not
+            # touch the playback range — the artist may have trimmed it to
+            # work on a section and would lose that on every save.
+            self.setupCurrentFile(forceUI=False, syncRange=False)
         else:
             item = self.currentItem()
             if item:
@@ -468,8 +479,168 @@ class SynthEyesHost(RamHost):
         state_short = state.shortName() if state else None
         return self._RamHost__save(saveFilePath, incremental, comment, state_short)
 
-    def _setupCurrentFile(self, item: RamItem, step: RamStep, setupOptions: dict, shot_obj: object = None, forceUI: bool = False) -> bool:
-        """Sets the current file parameters (resolution, FPS, aspect)."""
+    def _syncShotLength(self, shot: object) -> bool:
+        """Makes the shot report the plate's real length.
+
+        The Sizzle reference on ``Shot.frameCount``: "Be sure to set this,
+        based on actualLength, after opening a new shot." SynthEyes' own
+        ``rendercam.szl`` does exactly Flush -> frameCount -> Validate. Without
+        it the shot can report a stale length, and the playback range derived
+        from it below would inherit that.
+
+        Guarded on inequality because frameCount can invalidate the RAM cache,
+        so this must be a no-op once the shot already agrees.
+
+        Returns:
+            bool: True if the length is (or was made) correct.
+        """
+        try:
+            actual = int(shot.Get("actualLength") or 0)
+        except Exception as e:
+            self._log(f"Could not read the shot length: {e}", LogLevel.Debug)
+            return False
+        if actual <= 0:
+            return False
+        try:
+            if int(shot.Get("frameCount") or 0) == actual:
+                return True
+        except Exception:
+            pass  # unreadable frameCount — fall through and set it
+
+        # BeginShotChanges (not Begin): footage length is exactly the kind of
+        # attribute that invalidates the RAM cache.
+        self.hlev.BeginShotChanges(shot)
+        try:
+            shot.Flush()
+            shot.Set("frameCount", actual)
+            shot.Validate()
+            self.hlev.AcceptShotChanges(shot, "Ramses: Sync Shot Length")
+            return True
+        except Exception as e:
+            try: self.hlev.Cancel()
+            except Exception: pass
+            self._log(f"Failed to sync the shot length: {e}", LogLevel.Warning)
+            return False
+
+    def _setPlayRange(self, start: int, end: int) -> bool:
+        """Sets the playback range, in an order SynthEyes will accept.
+
+        ``SetAnimStart``/``SetAnimEnd`` write ``Scene.playStart``/``playEnd``,
+        and the Sizzle reference requires playStart to stay *below* playEnd at
+        every moment ("you will need to change Start or End first, depending on
+        the situation"). A fixed order therefore silently drops one of the two
+        writes whenever the range moves the wrong way.
+
+        Reads the values back and warns if SynthEyes clamped them, because the
+        old code failed at this completely silently.
+
+        Returns:
+            bool: True if the range reads back exactly as requested.
+        """
+        try:
+            if start > self.hlev.AnimEnd():
+                # Moving the range up: End first, or playStart would land
+                # above playEnd and be rejected.
+                self.hlev.SetAnimEnd(end)
+                self.hlev.SetAnimStart(start)
+            else:
+                self.hlev.SetAnimStart(start)
+                self.hlev.SetAnimEnd(end)
+
+            got_start = self.hlev.AnimStart()
+            got_end = self.hlev.AnimEnd()
+        except Exception as e:
+            self._log(f"Failed to set the playback range: {e}", LogLevel.Warning)
+            return False
+
+        if int(got_start) != int(start) or int(got_end) != int(end):
+            self._log(
+                f"Playback range {start}-{end} was clamped to "
+                f"{got_start}-{got_end} by SynthEyes.",
+                LogLevel.Warning,
+            )
+            return False
+        return True
+
+    def _syncPlayRange(self, shot: object, setupOptions: dict, forceUI: bool = False) -> bool:
+        """Aligns the playback range with the shot's own frame range.
+
+        SynthEyes numbers a shot's frames internally from ``shot.start``, and
+        the playback range must stay inside the active shot or it gets clamped.
+        This is what SynthEyes' own importers do (``abcimport.szl`` and
+        friends)::
+
+            Scene.playStart = shot.start
+            Scene.playEnd   = shot.stop
+
+        The Ramses duration is only a database estimate and never defines the
+        range; it is a fallback for when the shot cannot answer, and even then
+        it counts from the shot's own start rather than from an invented base.
+
+        Note this is deliberately NOT offset by ``shot.frameFirstOffset``: the
+        play range is in internal frame numbers. Whether the timebar *displays*
+        plate numbers is the separate, per-shot ``matchFrameNumbers`` setting,
+        which this plugin leaves alone.
+
+        Returns:
+            bool: True if the range was set and reads back as requested.
+        """
+        start = end = None
+        try:
+            start = int(shot.Get("start"))
+            end = int(shot.Get("stop"))
+        except Exception as e:
+            self._log(f"Could not read the shot frame range: {e}", LogLevel.Debug)
+
+        if start is None or end is None or end < start:
+            # The shot cannot tell us. Fall back to the Ramses duration, but
+            # keep the shot's start if we have it. Note actualLength is NOT
+            # used here: the reference says it reads 10 for an unreadable
+            # shot, so it cannot be distinguished from a real 10-frame plate.
+            frames = int(setupOptions.get("frames", 0) or 0)
+            if frames <= 0:
+                dur = float(setupOptions.get("duration", 0) or 0)
+                fps = float(setupOptions.get("framerate", 24.0) or 24.0)
+                frames = int(round(dur * fps))
+            if frames <= 0:
+                self._log(
+                    "No frame range available from the shot or from Ramses — "
+                    "leaving the playback range alone.",
+                    LogLevel.Debug,
+                )
+                return False
+            if start is None:
+                start = 0
+            end = start + frames - 1
+            self._log(
+                f"Shot reported no frame range; using the Ramses duration "
+                f"({frames} frames) instead.",
+                LogLevel.Debug,
+            )
+
+        ok = self._setPlayRange(start, end)
+
+        # Jump to the start only if we are forcing UI and the current frame is
+        # outside the range we just set.
+        if forceUI:
+            try:
+                current = self.hlev.Frame()
+                if current < start or current > end:
+                    self.hlev.SetFrame(start)
+                    self.hlev.Redraw()
+            except Exception:
+                pass
+
+        return ok
+
+    def _setupCurrentFile(self, item: RamItem, step: RamStep, setupOptions: dict, shot_obj: object = None, forceUI: bool = False, syncRange: bool = False) -> bool:
+        """Sets the current file parameters (resolution, FPS, aspect).
+
+        Args:
+            syncRange: Align the playback range with the shot. Only for a
+                shot that was just created, imported or explicitly re-synced —
+                a plain save must not overwrite a range the artist trimmed.
+        """
         if not self.hlev:
             return False
         
@@ -550,35 +721,14 @@ class SynthEyesHost(RamHost):
                 except Exception: pass
                 self._log(f"Camera activation skipped: {e}", LogLevel.Debug)
 
-        # 3. Frame range — UI controls, not shot attributes (Safe)
-        frames = int(setupOptions.get("frames", 0))
-        
-        # Smart Frame Range: If Ramses says 1 (movie), trust SynthEyes if it has more.
-        try:
-            se_frames = int(shot.frames or 0)
-            if se_frames > 1 and frames <= 1:
-                frames = se_frames
-        except Exception:
-            pass
-
-        if not frames:
-            dur = float(setupOptions.get("duration", 0))
-            fps = float(setupOptions.get("framerate", 24.0))
-            frames = int(round(dur * fps))
-
-        if frames > 0:
-            start = int(RAM_SETTINGS.userSettings.get("compStartFrame", 1001))
-            self.hlev.SetAnimStart(start)
-            self.hlev.SetAnimEnd(start + frames - 1)
-            
-            # Jump to start only if we are forcing UI and currently out of range
-            if forceUI:
-                try:
-                    if abs(self.hlev.Frame() - start) > frames:
-                        self.hlev.SetFrame(start)
-                        self.hlev.Redraw()
-                except Exception:
-                    pass
+        # 3. Frame range — driven by the PLATE, not by the Ramses duration.
+        #
+        # Only on syncRange: a scene that is merely being saved must keep the
+        # range the artist set. Overwriting it on every save is what made this
+        # look like "the range never sticks".
+        if syncRange:
+            self._syncShotLength(shot)
+            self._syncPlayRange(shot, setupOptions, forceUI=forceUI)
 
         # Clear any temporary SyPy frame overrides
         try:
@@ -629,7 +779,8 @@ class SynthEyesHost(RamHost):
                 
                 # Sync scene settings (FPS, frame range) to the new shot
                 # We force UI updates here as it's a new scene.
-                self._setupCurrentFile(item, step, self.collectItemSettings(item), shot_obj=res, forceUI=True)
+                self._setupCurrentFile(item, step, self.collectItemSettings(item),
+                                       shot_obj=res, forceUI=True, syncRange=True)
                 
                 return True
             else:
@@ -1099,10 +1250,13 @@ class SynthEyesHost(RamHost):
                     self._pending_new_shot_item = item
                     self._pending_new_shot_step = step
 
-                self._setupCurrentFile(item, step, self.collectItemSettings(item), shot_obj=res, forceUI=True)
+                self._setupCurrentFile(item, step, self.collectItemSettings(item),
+                                       shot_obj=res, forceUI=True, syncRange=True)
 
                 try:
-                    num_frames = int(res.frames or 0)
+                    # actualLength, not "frames": SynthEyes shots have no
+                    # `frames` attribute, so the old read always logged 0.
+                    num_frames = int(res.Get("actualLength") or 0)
                     self._log(f"Import successful. Shot has {num_frames} frames.", LogLevel.Info)
                 except Exception:
                     pass
