@@ -10,32 +10,27 @@ from upstream — anything the SDK gets wrong is corrected here at runtime.
 Applied at import time:
  - DisableMakedirs / guarded os.makedirs (see below).
 
-Applied by apply():
- - RamDaemonInterface.online: returns False on any error instead of leaking
-   KeyError/socket exceptions when the daemon dies mid-reply.
+apply() currently installs nothing. It stays as the hook for the next patch,
+and because syntheyes_host calls it at import.
 
 Usage:
     import ramses_patches
     ramses_patches.apply()
 
-Removed, because they are fixed in the vendored SDK as of Ramses-Py 30582ce
-(PRs #12/#13):
+Removed, because they are fixed in the vendored SDK:
  - RamMetaDataManager.getMetaData no longer prunes entries for missing files
+   (Ramses-Py 30582ce, PRs #12/#13)
  - RamMetaDataManager.setFileMetaData refuses to rewrite from an unreadable
-   sidecar
- - RamMetaDataManager.getValue/setValue guard a falsy filePath
+   sidecar (30582ce)
+ - RamMetaDataManager.getValue/setValue guard a falsy filePath (30582ce)
+ - RamDaemonInterface.online returns False instead of leaking socket
+   exceptions from a call that only answers "is the daemon there?"
+   (Ramses-Py d19ce44, PR #16)
 
 Those patches replaced the SDK's methods wholesale, so keeping them after the
 update would have silently overridden upstream's implementations and masked
 any later improvement to them. The behaviour is still covered by tests, which
 now assert it of the vendored SDK itself rather than of a patch.
-
-The daemon patch is NOT redundant and stays. Upstream's fix is narrower: it
-made __testConnection() tolerate a malformed *reply*, but online() is still a
-bare `return self.__testConnection()`, so anything the socket layer raises
-(ConnectionResetError and friends from __post) still escapes a call that
-exists only to answer "is the daemon there?". Removing this patch was tried
-and the test caught it immediately.
 """
 
 import os
@@ -44,41 +39,14 @@ from ramses.constants import LogLevel
 from ramses.logger import log
 
 
-def _patch_daemon_interface():
-    """Makes RamDaemonInterface.online() never raise.
-
-    online() is a connectivity probe and callers expect a bool. Upstream now
-    guards the *shape* of the ping reply inside __testConnection(), but
-    online() itself is a bare `return self.__testConnection()` and the socket
-    send/recv path underneath can still raise (ConnectionResetError, and
-    whatever a daemon dying mid-reply produces). Wrap it so a probe never
-    takes down its caller.
-    """
-    from ramses.daemon_interface import RamDaemonInterface
-
-    # This wraps the current online(), so a second apply() would wrap the
-    # wrapper. SynthEyes runs the plugin in a fresh interpreter so apply()
-    # happens once, but Ramses-Fusion reloads its host module on every launch
-    # and did stack wrappers one layer per launch before this guard existed.
-    if getattr(RamDaemonInterface, "_ramses_patched", False):
-        return
-
-    _original_online = RamDaemonInterface.online
-
-    def _patched_online(self):
-        try:
-            return bool(_original_online(self))
-        except Exception as e:
-            log("Daemon connectivity check failed: " + str(e), LogLevel.Debug)
-            return False
-
-    RamDaemonInterface.online = _patched_online
-    RamDaemonInterface._ramses_patched = True
-
-
 def apply():
-    """Applies all available runtime patches."""
-    _patch_daemon_interface()
+    """Applies all available runtime patches.
+
+    Nothing to install at the moment. Any future patch must be idempotent:
+    SynthEyes runs the plugin in a fresh interpreter so apply() happens once
+    here, but the same module ships in Ramses-Fusion, whose entry script
+    reloads its host module on every launch.
+    """
     log("Ramses runtime patches applied.", LogLevel.Debug)
 
 
