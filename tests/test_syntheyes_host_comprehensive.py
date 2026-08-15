@@ -887,3 +887,43 @@ class TestSaveAsTemplate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Export extension: the name comes from the exporter's own SIZZLEX header
+# ---------------------------------------------------------------------------
+
+class TestExportExtension(unittest.TestCase):
+    """A Blender export is a .py, not a .txt.
+
+    Names and extensions are taken from the SIZZLEX header of each shipped
+    exporter, e.g. scripts/blender25.szl declares
+    "//SIZZLEX .py Blender (Python)" and scripts/Fusion/fu7comp.szl declares
+    "//SIZZLEX .comp Fusion Composition".
+    """
+
+    def test_fusion_is_a_comp(self):
+        self.assertEqual(
+            SynthEyesHost._exportExtension("Fusion Composition"), "comp"
+        )
+
+    def test_blender_is_a_py(self):
+        # Previously fell through to "txt", so the published matchmove would
+        # not have been recognised as a script by anything downstream.
+        self.assertEqual(
+            SynthEyesHost._exportExtension("Blender (Python)"), "py"
+        )
+
+    def test_the_legacy_blender_exporter_also_maps_to_py(self):
+        # "Blender - Early (Python)" in scripts/Older.
+        self.assertEqual(
+            SynthEyesHost._exportExtension("Blender - Early (Python)"),
+            "py",
+        )
+
+    def test_an_unknown_export_type_keeps_the_old_default(self):
+        # Guessing an extension for an exporter we have not checked would be
+        # worse than the generic one.
+        self.assertEqual(
+            SynthEyesHost._exportExtension("Some Other Exporter"), "txt"
+        )

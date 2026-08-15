@@ -1462,6 +1462,23 @@ class SynthEyesHost(RamHost):
             RamMetaDataManager.setVersionFilePath(file, self.currentVersionFilePath())
         return True
 
+    # Extensions SynthEyes writes for the export types we name, taken from the
+    # SIZZLEX header of each shipped exporter (e.g. scripts/blender25.szl
+    # declares "//SIZZLEX .py Blender (Python)"). Anything unrecognised keeps
+    # the previous default rather than guessing.
+    EXPORT_EXTENSIONS = (
+        ("Fusion", "comp"),
+        ("Blender", "py"),
+    )
+
+    @classmethod
+    def _exportExtension(cls, exportType: str) -> str:
+        """The file extension for a File > Export menu entry."""
+        for needle, extension in cls.EXPORT_EXTENSIONS:
+            if needle in exportType:
+                return extension
+        return "txt"
+
     def _publish(self, publishInfo: RamFileInfo, publishOptions: dict) -> list:
         """Exports tracking data to the publish folder using SynthEyes Export."""
         if not self.hlev:
@@ -1471,7 +1488,7 @@ class SynthEyesHost(RamHost):
 
         options = publishOptions or {}
         export_type = options.get("exportType", "Fusion Composition")
-        ext = "comp" if "Fusion" in export_type else "txt"
+        ext = self._exportExtension(export_type)
 
         publishInfo.extension = ext
         if not publishInfo.resource:
@@ -1544,8 +1561,8 @@ class SynthEyesHost(RamHost):
             # Tracking-data export type — must match a File › Export menu entry.
             export_combo = qw.QComboBox()
             export_combo.setEditable(True)
-            for name in ("Fusion Composition", "Nuke (.nk)", "After Effects (.jsx)",
-                         "Maya (.ma)", "3DS Max (.ms)"):
+            for name in ("Fusion Composition", "Blender (Python)", "Nuke (.nk)",
+                         "After Effects (.jsx)", "Maya (.ma)", "3DS Max (.ms)"):
                 export_combo.addItem(name)
             export_combo.setEditText(str(options.get("exportType", "Fusion Composition")))
             export_combo.setToolTip(
