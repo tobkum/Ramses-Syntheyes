@@ -1568,8 +1568,7 @@ class SynthEyesHost(RamHost):
                 export_combo.addItem(name)
             export_combo.setEditText(str(options.get("exportType", "Fusion Composition")))
             export_combo.setToolTip(
-                "Must match an entry in the SynthEyes File › Export menu exactly.
-"
+                "Must match an entry in the SynthEyes File › Export menu exactly.\n"
                 "Other exporters can be typed in; check the name in the menu first.")
             form.addRow("Export type:", export_combo)
 
