@@ -1559,14 +1559,18 @@ class SynthEyesHost(RamHost):
             layout.addLayout(form)
 
             # Tracking-data export type — must match a File › Export menu entry.
+            # Only names verified against the exporters SynthEyes ships, whose
+            # SIZZLEX header line declares the menu name. The combo stays
+            # editable, so an unlisted exporter can still be typed in.
             export_combo = qw.QComboBox()
             export_combo.setEditable(True)
-            for name in ("Fusion Composition", "Blender (Python)", "Nuke (.nk)",
-                         "After Effects (.jsx)", "Maya (.ma)", "3DS Max (.ms)"):
+            for name in ("Fusion Composition", "Blender (Python)"):
                 export_combo.addItem(name)
             export_combo.setEditText(str(options.get("exportType", "Fusion Composition")))
             export_combo.setToolTip(
-                "Must match an entry in the SynthEyes File › Export menu exactly.")
+                "Must match an entry in the SynthEyes File › Export menu exactly.
+"
+                "Other exporters can be typed in; check the name in the menu first.")
             form.addRow("Export type:", export_combo)
 
             # Preview output format (file extension).
