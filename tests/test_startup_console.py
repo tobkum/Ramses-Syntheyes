@@ -106,3 +106,26 @@ class TestSetConsoleVisible(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRestoredMarker(unittest.TestCase):
+    """The header line that distinguishes a restored copy from the working file.
+
+    Without it the header is identical either way, and the two behave
+    differently on the next save: the copy jumps the version.
+    """
+
+    def test_it_names_the_restored_version(self):
+        html = entry._restored_marker_html(2)
+
+        self.assertIn("RESTORED v2", html)
+
+    def test_it_says_the_working_file_has_not_moved_yet(self):
+        # "Restored, now at v2" would read as though the newer versions were
+        # gone. They are not: they stay until the artist saves.
+        self.assertIn("not the current file yet", entry._restored_marker_html(2))
+
+    def test_an_ordinary_file_gets_no_marker(self):
+        for value in (-1, 0, None):
+            with self.subTest(value=value):
+                self.assertEqual("", entry._restored_marker_html(value))

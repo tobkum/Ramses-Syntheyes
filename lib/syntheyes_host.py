@@ -3,6 +3,7 @@ import os
 import time
 import json
 import re
+import filecmp
 from ramses import (
     RamHost,
     RamItem,
@@ -196,6 +197,39 @@ class SynthEyesHost(RamHost):
         except Exception:
             return ""
 
+    def currentRestoredVersion(self) -> int:
+        """The version this scene was restored from, or -1 when it is not a copy.
+
+        restoreVersion() does not overwrite the working file: it copies the
+        chosen version up beside it as `<name>_+restored-vN+.sni` and opens
+        that. While the artist sits in that copy the version they are looking
+        at is N, and the file name is the only place that says so.
+        """
+        path = self.currentFilePath()
+        if not path:
+            return -1
+        nm = RamFileInfo()
+        nm.setFilePath(path)
+        if not nm.isRestoredVersion:
+            return -1
+        return nm.restoredVersion
+
+    def currentVersion(self) -> int:
+        """The version of the current scene.
+
+        Overridden for restored copies. The base implementation finds the
+        highest version in _versions that matches the current file's name, and
+        a restored copy strips back to that same name with no version of its
+        own, so it answered with the NEWEST version while the artist was
+        looking at an older one. A plausible wrong number rather than an
+        obviously broken one, and updateStatus() would write it to the
+        database.
+        """
+        restored = self.currentRestoredVersion()
+        if restored > 0:
+            return restored
+        return super(SynthEyesHost, self).currentVersion()
+
     def resolvePreviewPath(self) -> str:
         """Returns the most recent preview file for the current shot, or "".
 
@@ -342,6 +376,11 @@ class SynthEyesHost(RamHost):
     def _open(self, filePath: str, item: RamItem, step: RamStep) -> bool:
         """Internal implementation to open an .sni file."""
         filePath = self.normalizePath(filePath)
+        # Whatever restoreVersion() left us in is being left behind now.
+        # Cleaning up only on save would still leak one copy per restore that
+        # the artist looked at and then moved on from, including restoring
+        # twice in a row. Discarded only after the open actually succeeds.
+        abandoned = self.currentFilePath()
         if not os.path.exists(filePath):
             # File doesn't exist yet — this happens when _openUI returned a new
             # scene created via newShot() without a filePath key, causing the
@@ -361,6 +400,7 @@ class SynthEyesHost(RamHost):
                     self._markDirtyAndSave(filePath)
                     # Write sidecar now that the file is on disk
                     self._store_ramses_metadata(item, step or pending_step, filePath)
+                    self._discardAbandoned(abandoned, filePath)
                     return True
                 except Exception as e:
                     self._log(f"Failed to save new scene to pipeline path: {e}", LogLevel.Critical)
@@ -371,6 +411,7 @@ class SynthEyesHost(RamHost):
             # the newly opened file supplies its own identity via sidecar/notes.
             self._pending_new_shot_item = None
             self._pending_new_shot_step = None
+            self._discardAbandoned(abandoned, filePath)
             return True
         except Exception as e:
             self._log(f"Failed to open scene: {e}", LogLevel.Critical)
@@ -477,7 +518,153 @@ class SynthEyesHost(RamHost):
             return self.saveAs()
 
         state_short = state.shortName() if state else None
-        return self._RamHost__save(saveFilePath, incremental, comment, state_short)
+        # Read before the save: saving a restored copy moves the scene back
+        # onto the real working file, and the marker is gone from
+        # currentFilePath() by the time there is anything to clean up.
+        restoredCopy = self.currentFilePath()
+
+        if not self._RamHost__save(saveFilePath, incremental, comment, state_short):
+            return False
+
+        self._discardRestoredCopy(restoredCopy)
+        return True
+
+    # ------------------------------------------------------------------
+    # Restored copies
+    # ------------------------------------------------------------------
+
+    def _discardRestoredCopy(self, restoredCopy: str) -> None:
+        """Removes the `+restored-vN+` copy the save just superseded.
+
+        restoreVersion() leaves that copy in the working folder and nothing
+        else deletes it. It is not in _versions, so no version listing shows
+        it, and it is not the working file, so nothing opens it again: one
+        accumulates per restore, beside the file the artist works in.
+
+        Only when the save landed on exactly this copy's own save path, which
+        rules out a Save As that moved the work to another item.
+        """
+        if not restoredCopy:
+            return
+        try:
+            with DisableMakedirs():
+                savePath = RamFileManager.getSaveFilePath(restoredCopy)
+            if not savePath:
+                return
+            if os.path.normcase(self.normalizePath(savePath)) != os.path.normcase(
+                self.currentFilePath()
+            ):
+                return
+        except Exception as e:
+            self._log(f"Could not check the restored copy: {e}", LogLevel.Debug)
+            return
+
+        self._discardIfRedundantRestoredCopy(
+            restoredCopy, f"its content is now version {self.currentVersion()}"
+        )
+
+    def _discardAbandoned(self, abandoned: str, openedPath: str) -> None:
+        """Drops a restored copy the scene has just moved away from.
+
+        `_open` has two success paths (an existing file, and a brand new shot
+        saved into its pipeline path), and both leave whatever was open behind.
+        """
+        if not abandoned:
+            return
+        if os.path.normcase(abandoned) == os.path.normcase(openedPath):
+            return
+        self._discardIfRedundantRestoredCopy(abandoned, "it was left behind unchanged")
+
+    def _discardIfRedundantRestoredCopy(self, restoredCopy: str, because: str) -> None:
+        """Deletes a `+restored-vN+` copy, but only while it is still a duplicate.
+
+        The single criterion is content: byte-identical to the version file it
+        was restored from. That is stronger than checking the version still
+        exists, and it is what keeps this safe against anything that writes
+        into the copy without going through save() - SynthEyes' own Save, a
+        script calling hlev.SaveSNI(), an autosave.
+
+        Never raises. By the time this runs the save or the open has already
+        succeeded, so a failure here would report completed work as failed.
+        A leftover file is the lesser evil.
+        """
+        try:
+            if not self._restoredCopySource(restoredCopy):
+                return
+            os.remove(restoredCopy)
+            self._forgetFileMetaData(restoredCopy)
+            self._log(
+                f"Removed the restored copy {os.path.basename(restoredCopy)}; "
+                f"{because}.",
+                LogLevel.Debug,
+            )
+        except Exception as e:
+            self._log(
+                f"Could not remove the restored copy "
+                f"{os.path.basename(restoredCopy)}: {e}",
+                LogLevel.Warning,
+            )
+
+    def _restoredCopySource(self, path: str) -> str:
+        """The version file a restored copy still duplicates, or "".
+
+        Returns "" for anything that must be kept: not a restored copy, its
+        version is gone from _versions, or its content has diverged from that
+        version.
+        """
+        if not path or not os.path.isfile(path):
+            return ""
+
+        nm = RamFileInfo()
+        nm.setFilePath(path)
+        if not nm.isRestoredVersion or nm.restoredVersion <= 0:
+            return ""
+
+        with DisableMakedirs():
+            savePath = RamFileManager.getSaveFilePath(path)
+            if not savePath:
+                return ""
+            versionFiles = RamFileManager.getVersionFilePaths(savePath)
+
+        for versionFile in versionFiles:
+            info = RamFileInfo()
+            info.setFilePath(versionFile)
+            if info.version != nm.restoredVersion:
+                continue
+            # shallow=False: compare the bytes. The copy and its source differ
+            # in mtime by construction, so a stat comparison always says
+            # "different" and would never delete anything.
+            if filecmp.cmp(path, versionFile, shallow=False):
+                return versionFile
+            self._log(
+                f"{os.path.basename(path)} has been edited since it was "
+                f"restored, so it is no longer a copy of version "
+                f"{nm.restoredVersion}. Keeping it.",
+                LogLevel.Warning,
+            )
+            return ""
+
+        self._log(
+            f"Keeping {os.path.basename(path)}: version {nm.restoredVersion} is no "
+            f"longer in the versions folder, so this copy is the only one left.",
+            LogLevel.Warning,
+        )
+        return ""
+
+    def _forgetFileMetaData(self, filePath: str) -> None:
+        """Drops a deleted file's entry from its folder's metadata sidecar.
+
+        Without this the sidecar grows an entry per restore, each one naming a
+        file that no longer exists.
+        """
+        try:
+            folder = os.path.dirname(filePath)
+            data = RamMetaDataManager.getMetaData(folder)
+            if data.pop(os.path.basename(filePath), None) is None:
+                return
+            RamMetaDataManager.setMetaData(folder, data)
+        except Exception as e:
+            self._log(f"Could not clean the metadata entry: {e}", LogLevel.Debug)
 
     def _syncShotLength(self, shot: object) -> bool:
         """Makes the shot report the plate's real length.

@@ -171,6 +171,22 @@ def _quarantine_corrupt_addon_settings():
         except OSError:
             pass
 
+def _restored_marker_html(restored_version: int) -> str:
+    """The header line that says the scene is a restored copy, or "".
+
+    Module level and pure so it can be tested: the panel that uses it lives
+    inside run_app() and needs a live Qt to build, which is the reason the
+    equivalent marker went untested in the Blender add-on until a
+    break-on-purpose run caught it.
+    """
+    if not restored_version or restored_version < 1:
+        return ""
+    return (
+        f"<br><font color='#cc9900' size='3'><b>RESTORED v{restored_version}</b></font>"
+        f"<font color='#777' size='3'> — not the current file yet</font>"
+    )
+
+
 def run_app():
     # First thing, before any print: otherwise the console flashes on screen
     # before it is hidden. Kept visible when debugLog is on.
@@ -637,6 +653,17 @@ def run_app():
                     f"{seq_prefix}<font color='#FFF' size='5'><b>{item_name}</b>{priority_suffix}</font><br>"
                     f"<font size='3'>{step_name}{state_label}</font>"
                 )
+
+                # Restoring opens a copy beside the working file rather than
+                # replacing it. Without this line the header is identical
+                # either way, and the two behave differently on save: the copy
+                # jumps the version.
+                try:
+                    restored = self.host.currentRestoredVersion()
+                except Exception:
+                    restored = -1
+                html += _restored_marker_html(restored)
+
                 self.context_label.setText(html)
             else:
                 path = self.host.currentFilePath()
@@ -773,7 +800,15 @@ def run_app():
         def on_retrieve(self):
             if self.host.restoreVersion():
                 self.refresh_context()
-                self._set_status("✓ Version restored.", "ok")
+                restored = self.host.currentRestoredVersion()
+                label = f"v{restored}" if restored > 0 else "an earlier version"
+                # Deliberately not "you are now at vN": the working file still
+                # holds the newer work until the artist saves, and saying
+                # otherwise invites them to think the newer versions are gone.
+                self._set_status(
+                    f"✓ Opened {label} as a copy — save to make it the current version.",
+                    "ok",
+                )
 
         def on_save_as(self):
             if self.host.saveAs():
